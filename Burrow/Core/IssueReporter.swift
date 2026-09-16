@@ -59,8 +59,10 @@ enum IssueReporter {
     }
 
     /// Opens the reporter's browser at a pre-filled new-issue page.
-    static func open(_ kind: Kind = .bug) {
-        guard let url = newIssueURL(kind) else {
+    /// `context` is an optional extra line seeded into the body (e.g. a path
+    /// the user wants a cleanup rule for).
+    static func open(_ kind: Kind = .bug, context: String? = nil) {
+        guard let url = newIssueURL(kind, context: context) else {
             log.error("Failed to build GitHub issue URL")
             return
         }
@@ -69,9 +71,10 @@ enum IssueReporter {
 
     /// Builds the pre-filled `issues/new` URL. Exposed (non-private) so tests
     /// can assert the template and diagnostics without launching a browser.
-    static func newIssueURL(_ kind: Kind) -> URL? {
+    static func newIssueURL(_ kind: Kind, context: String? = nil) -> URL? {
+        let contextBlock = context.map { "\n\n**Context:** \($0)" } ?? ""
         let body = """
-        \(kind.bodyTemplate)
+        \(kind.bodyTemplate)\(contextBlock)
 
         ---
         _Diagnostics (please keep):_

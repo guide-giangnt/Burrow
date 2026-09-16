@@ -48,6 +48,16 @@ enum CleanRule: Hashable, Codable {
         }
     }
 
+    /// The filesystem path this rule targets, or nil for `.command` rules
+    /// (which have no path). Handy for coverage checks and diagnostics.
+    var path: String? {
+        switch self {
+        case let .directoryContents(path, _, _, _): return path
+        case let .glob(path, _, _, _):              return path
+        case .command:                              return nil
+        }
+    }
+
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         switch self {

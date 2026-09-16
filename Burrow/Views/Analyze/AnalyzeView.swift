@@ -83,6 +83,7 @@ struct AnalyzeView: View {
             VStack(alignment: .leading, spacing: Spacing.xl) {
                 header
                 columns
+                UncoveredCachesSection(vm: vm)
             }
             .padding(.horizontal, Spacing.xxl + Spacing.sm)
             .padding(.vertical, Spacing.xxl)

@@ -37,7 +37,8 @@ final class AnalyzeViewModelTests: XCTestCase {
         looseBytes: Int64 = 0,
         folderScans: [URL: DiskUsageScanner.FolderScan] = [:],
         capacity: (total: Int64, free: Int64, name: String)? = (512, 200, "Test HD"),
-        applications: Int64 = 0
+        applications: Int64 = 0,
+        uncovered: [DiskEntry] = []
     ) -> AnalyzeViewModel {
         AnalyzeViewModel(
             capacity: { _ in capacity },
@@ -46,11 +47,21 @@ final class AnalyzeViewModelTests: XCTestCase {
                 folderScans[url.standardizedFileURL] ?? DiskUsageScanner.FolderScan(total: 0, children: [])
             },
             applicationsSize: { applications },
+            discoverUncovered: { uncovered },
             homeDirectory: home
         )
     }
 
     // MARK: - Scan
+
+    func testScanPopulatesUncovered() async throws {
+        let home = fixture!
+        let cache = home.appendingPathComponent("Library/Caches/big")
+        let entry = makeEntry(url: cache, size: 200 * 1024 * 1024)
+        let vm = makeVM(home: home, dirs: [], uncovered: [entry])
+        await vm.scan()
+        XCTAssertEqual(vm.uncovered.map(\.url), [cache.standardizedFileURL])
+    }
 
     func testScanStreamsResultsAndBreakdown() async throws {
         let home = fixture!

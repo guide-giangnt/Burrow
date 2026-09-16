@@ -41,6 +41,10 @@ final class AnalyzeViewModel: ObservableObject {
     @Published private(set) var largestFolders: [DiskEntry] = []
     @Published var sortOrder: FolderSort = .bySize
 
+    /// Large cache/log folders no Clean rule covers yet — surfaced so users
+    /// can reclaim the space or suggest a rule. Populated after each scan.
+    @Published private(set) var uncovered: [DiskEntry] = []
+
     /// Largest subfolders per folder URL (top-level pre-filled during the scan,
     /// deeper levels loaded lazily on expand).
     @Published private(set) var childrenCache: [URL: [DiskEntry]] = [:]
@@ -73,6 +77,7 @@ final class AnalyzeViewModel: ObservableObject {
     private let topLevel: @Sendable (URL) -> (dirs: [URL], looseBytes: Int64)
     private let scanFolder: @Sendable (URL) async -> DiskUsageScanner.FolderScan
     private let applicationsSize: @Sendable () async -> Int64
+    private let discoverUncovered: @Sendable () async -> [DiskEntry]
     private let homeDirectory: URL
 
     private var scanTask: Task<Void, Never>?
@@ -97,12 +102,15 @@ final class AnalyzeViewModel: ObservableObject {
                 }
                 return total
             },
+        discoverUncovered: @escaping @Sendable () async -> [DiskEntry]
+            = { await UncoveredCacheScanner.discover() },
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
     ) {
         self.capacity = capacity
         self.topLevel = topLevel
         self.scanFolder = scanFolder
         self.applicationsSize = applicationsSize
+        self.discoverUncovered = discoverUncovered
         self.homeDirectory = homeDirectory
     }
 
@@ -118,11 +126,13 @@ final class AnalyzeViewModel: ObservableObject {
         largestFolders = []
         childrenCache = [:]
         loadingChildren = []
+        uncovered = []
         foldersScanned = 0
 
         let home = homeDirectory
         let scanFolder = self.scanFolder
         let applicationsSize = self.applicationsSize
+        let discoverUncovered = self.discoverUncovered
 
         scanTask = Task { [weak self] in
             guard let self else { return }
@@ -134,8 +144,10 @@ final class AnalyzeViewModel: ObservableObject {
             // Show the dashboard immediately (capacity known; folders fill in).
             self.update(cap: cap, totals: [:], looseBytes: looseBytes, appsBytes: 0)
 
-            // /Applications sizing runs alongside the folder fan-out.
+            // /Applications sizing and uncovered-cache discovery run alongside
+            // the folder fan-out.
             async let appsBytesTask = applicationsSize()
+            async let uncoveredTask = discoverUncovered()
 
             var totals: [URL: Int64] = [:]
             let maxConcurrent = max(2, ProcessInfo.processInfo.activeProcessorCount - 1)
@@ -163,8 +175,10 @@ final class AnalyzeViewModel: ObservableObject {
             }
 
             let appsBytes = await appsBytesTask
+            let uncovered = await uncoveredTask
             if !Task.isCancelled {
                 self.update(cap: cap, totals: totals, looseBytes: looseBytes, appsBytes: appsBytes)
+                self.uncovered = uncovered
                 self.isScanning = false
                 logger.info("Scan finished: \(self.foldersScanned, privacy: .public) top-level folders")
             }
@@ -233,6 +247,7 @@ final class AnalyzeViewModel: ObservableObject {
                 dryRun: false
             ))
             largestFolders.removeAll { $0.url == entry.url }
+            uncovered.removeAll { $0.url == entry.url }
             childrenCache[entry.url] = nil
             logger.info(
                 "\(permanently ? "Deleted" : "Trashed", privacy: .public) \(bytes, privacy: .public) bytes at \(entry.url.path, privacy: .private)"
