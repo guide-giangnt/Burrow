@@ -1,0 +1,17 @@
+{
+  "manifestVersion": 1,
+  "catalogs": {
+    "CleanRules": {
+      "catalogVersion": 1,
+      "schemaVersion": 1,
+      "url": "https://raw.githubusercontent.com/guide-vinh/Burrow/main/Burrow/Resources/CleanRules.json",
+      "sha256": "12b031f1392f876d502e5efd51754e8b79f5d5a6ce2d809da503f177bd6b54b7"
+    },
+    "AppLeftovers": {
+      "catalogVersion": 1,
+      "schemaVersion": 2,
+      "url": "https://raw.githubusercontent.com/guide-vinh/Burrow/main/Burrow/Resources/AppLeftovers.json",
+      "sha256": "a5943097e28a2bdb8d8285ecfc5c9cd9c42c680f6c3af794b62f3aefa0df2e25"
+    }
+  }
+}

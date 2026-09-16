@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help build run test clean release verify-sign hooks
+.PHONY: help build run test clean release verify-sign hooks sync-mole publish-catalogs
 
 SCHEME    := Burrow
 APP_NAME  := Burrow.app
@@ -11,7 +11,7 @@ DEBUG_APP := $(BUILD_DIR)/Build/Products/Debug/$(APP_NAME)
 # the bottom turns those args into no-op goals so make doesn't error on
 # them. Note: $@ at top-level expands to empty — must compute the filter
 # inside the recipe.
-KNOWN_TARGETS := help build run test clean release verify-sign hooks
+KNOWN_TARGETS := help build run test clean release verify-sign hooks sync-mole publish-catalogs
 ARGS = $(filter-out $(KNOWN_TARGETS),$(MAKECMDGOALS))
 
 help: ## Show this help
@@ -53,6 +53,12 @@ clean: ## Remove build artifacts
 hooks: ## Install git commit-msg hook
 	git config core.hooksPath .githooks
 	@echo "core.hooksPath set to .githooks"
+
+sync-mole: ## Diff upstream tw93/Mole cleanup paths vs Burrow catalogs (review aid; use ARGS for flags)
+	python3 scripts/sync_mole.py $(ARGS)
+
+publish-catalogs: ## Regenerate catalog-manifest.json (fresh sha256) and commit+push (ARGS: --bump/--dry-run)
+	scripts/publish_catalogs.sh $(ARGS)
 
 # Catch-all so positional args (e.g. the `0.1.2` in `make release 0.1.2`)
 # don't trigger "no rule to make target" errors. Does nothing.
