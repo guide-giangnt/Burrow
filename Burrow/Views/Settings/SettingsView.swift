@@ -4,6 +4,7 @@ import SwiftUI
 /// "Burrow → Settings…" — also reachable from the sidebar Settings row.
 struct SettingsView: View {
     @ObservedObject var updater: UpdaterController
+    @ObservedObject var catalogUpdates: CatalogUpdateViewModel
 
     var body: some View {
         Form {
@@ -22,6 +23,8 @@ struct SettingsView: View {
                         .disabled(!updater.canCheckForUpdates)
                 }
             }
+
+            CatalogUpdatesSection(vm: catalogUpdates)
 
             Section("Help & Feedback") {
                 HStack {

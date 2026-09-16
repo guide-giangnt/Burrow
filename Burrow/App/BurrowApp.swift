@@ -4,6 +4,7 @@ import SwiftUI
 @main
 struct BurrowApp: App {
     @StateObject private var updater = UpdaterController()
+    @StateObject private var catalogUpdates = CatalogUpdateViewModel()
 
     private static let githubURL = URL(string: "https://github.com/guide-vinh/Burrow")!
 
@@ -11,6 +12,9 @@ struct BurrowApp: App {
         WindowGroup {
             RootView()
                 .environmentObject(updater)
+                // Best-effort catalog refresh on launch (throttled to 24h);
+                // never blocks the UI or the catalog load.
+                .task { await catalogUpdates.checkOnLaunchIfDue() }
         }
         .commands {
             // Replaces the default no-op "Burrow → About Burrow" group with
@@ -39,7 +43,7 @@ struct BurrowApp: App {
         }
 
         Settings {
-            SettingsView(updater: updater)
+            SettingsView(updater: updater, catalogUpdates: catalogUpdates)
         }
     }
 }
