@@ -7,6 +7,9 @@ import Foundation
 struct AppLeftoversCatalog: Codable, Hashable {
 
     let schemaVersion: Int
+    /// Monotonic content version, bumped on every published catalog change.
+    /// Optional so older bundled files without it still decode.
+    let catalogVersion: Int?
     let lastUpdated: String?
     let userPaths: [LeftoverPattern]
     let systemPaths: [LeftoverPattern]
@@ -37,13 +40,14 @@ struct AppLeftoversCatalog: Codable, Hashable {
     // MARK: - Codable
 
     private enum CodingKeys: String, CodingKey {
-        case schemaVersion, lastUpdated, userPaths, systemPaths,
+        case schemaVersion, catalogVersion, lastUpdated, userPaths, systemPaths,
              vendorOverrides, ignoreApps, homebrewDetection, macAppStoreDetection
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.schemaVersion = try c.decode(Int.self, forKey: .schemaVersion)
+        self.catalogVersion = try c.decodeIfPresent(Int.self, forKey: .catalogVersion)
         self.lastUpdated = try c.decodeIfPresent(String.self, forKey: .lastUpdated)
         self.userPaths = try c.decode([LeftoverPattern].self, forKey: .userPaths)
         self.systemPaths = try c.decode([LeftoverPattern].self, forKey: .systemPaths)
@@ -68,6 +72,7 @@ struct AppLeftoversCatalog: Codable, Hashable {
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(schemaVersion, forKey: .schemaVersion)
+        try c.encodeIfPresent(catalogVersion, forKey: .catalogVersion)
         try c.encodeIfPresent(lastUpdated, forKey: .lastUpdated)
         try c.encode(userPaths, forKey: .userPaths)
         try c.encode(systemPaths, forKey: .systemPaths)

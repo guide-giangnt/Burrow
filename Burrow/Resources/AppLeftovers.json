@@ -1,5 +1,6 @@
 {
   "schemaVersion": 2,
+  "catalogVersion": 1,
   "lastUpdated": "2026-04-26",
   "credit": "Pattern set derived from tw93/Mole's lib/uninstall lineage, AppCleaner conventions, and macOS Sonoma/Sequoia conventions. MIT.",
   "_documentation": {

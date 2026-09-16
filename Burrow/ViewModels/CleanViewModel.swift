@@ -75,11 +75,9 @@ final class CleanViewModel: ObservableObject {
     func loadCatalog() async {
         guard categories.isEmpty else { return }
 
-        guard let url = Bundle.main.url(forResource: "CleanRules", withExtension: "json") else {
-            lastError = "Catalog not found in app bundle"
-            logger.error("CleanRules.json not found in Bundle.main")
-            return
-        }
+        // Prefer a downloaded catalog when one is cached, valid, and newer;
+        // otherwise this returns the bundled resource.
+        let url = CatalogStore.shared.url(for: .cleanRules)
 
         let catalog: CleanCatalog
         do {
@@ -93,6 +91,7 @@ final class CleanViewModel: ObservableObject {
         let installed = Self.filterInstalled(catalog.categories)
         let installedCatalog = CleanCatalog(
             schemaVersion: catalog.schemaVersion,
+            catalogVersion: catalog.catalogVersion,
             categories: installed
         )
 

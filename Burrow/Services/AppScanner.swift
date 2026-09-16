@@ -207,7 +207,9 @@ actor AppScanner {
 
     private func loadCatalog() throws -> AppLeftoversCatalog {
         if let cached = cachedCatalog { return cached }
-        let url = catalogURL ?? Bundle.main.url(forResource: "AppLeftovers", withExtension: "json")!
+        // Test injection wins; otherwise prefer a cached/downloaded catalog
+        // when valid and newer, falling back to the bundled resource.
+        let url = catalogURL ?? CatalogStore.shared.url(for: .appLeftovers)
         let data = try Data(contentsOf: url)
         let catalog = try JSONDecoder().decode(AppLeftoversCatalog.self, from: data)
         cachedCatalog = catalog
