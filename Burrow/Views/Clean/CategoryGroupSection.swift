@@ -11,7 +11,17 @@ struct CategoryGroupSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.md) {
-            SectionLabel(text: displayName(for: group))
+            HStack(spacing: Spacing.sm) {
+                SectionLabel(text: displayName(for: group))
+                Spacer(minLength: Spacing.sm)
+                HStack(spacing: Spacing.xs + 2) {
+                    Text("Select all")
+                        .font(.captionM)
+                        .foregroundStyle(Color.fgSecondary)
+                    BurrowCheckbox(isOn: groupBinding)
+                }
+                .tooltip("Select all in \(displayName(for: group))")
+            }
             VStack(spacing: Spacing.xs) {
                 ForEach(categories) { category in
                     CategoryRow(
@@ -24,6 +34,15 @@ struct CategoryGroupSection: View {
             }
             .cardStyle()
         }
+    }
+
+    /// Checkbox state for the whole group: on when every category is selected,
+    /// and toggling selects all / clears all (a partial state selects the rest).
+    private var groupBinding: Binding<Bool> {
+        Binding(
+            get: { vm.isGroupSelected(categories) },
+            set: { _ in vm.toggleGroup(categories) }
+        )
     }
 
     private func binding(for id: String) -> Binding<Bool> {

@@ -358,6 +358,23 @@ final class CleanViewModel: ObservableObject {
         return hasAny
     }
 
+    /// True iff every category in `group` is currently selected. Drives a
+    /// group's "select all" checkbox.
+    func isGroupSelected(_ group: [CleanCategory]) -> Bool {
+        !group.isEmpty && group.allSatisfy { selectedCategoryIds.contains($0.id) }
+    }
+
+    /// Select all categories in `group`, or clear them if they're already all
+    /// selected. A partial selection counts as not-all → selects the rest.
+    func toggleGroup(_ group: [CleanCategory]) {
+        let ids = group.map(\.id)
+        if isGroupSelected(group) {
+            selectedCategoryIds.subtract(ids)
+        } else {
+            selectedCategoryIds.formUnion(ids)
+        }
+    }
+
     /// Toggle every item across all three lists on (any → all) or off
     /// (all → none). Empty lists are no-ops.
     func toggleSelectAll() {

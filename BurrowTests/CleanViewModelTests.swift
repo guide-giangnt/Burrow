@@ -18,6 +18,51 @@ final class CleanViewModelTests: XCTestCase {
         try super.tearDownWithError()
     }
 
+    // MARK: - Per-group selection
+
+    private func decodeCategories(ids: [String]) throws -> [CleanCategory] {
+        let cats = ids.map { id in
+            """
+            { "id": "\(id)", "title": "\(id)", "summary": "", "group": "developer",
+              "icon": "gear", "risk": "low", "defaultEnabled": false,
+              "rules": [ { "kind": "directoryContents", "path": "~/x" } ] }
+            """
+        }.joined(separator: ",")
+        return try JSONDecoder().decode([CleanCategory].self, from: Data("[\(cats)]".utf8))
+    }
+
+    func testToggleGroupSelectsThenClears() throws {
+        let group = try decodeCategories(ids: ["A", "B"])
+        let vm = CleanViewModel()
+        XCTAssertFalse(vm.isGroupSelected(group))
+        vm.toggleGroup(group)
+        XCTAssertTrue(vm.isGroupSelected(group))
+        XCTAssertEqual(vm.selectedCategoryIds, ["A", "B"])
+        vm.toggleGroup(group)
+        XCTAssertFalse(vm.isGroupSelected(group))
+        XCTAssertTrue(vm.selectedCategoryIds.isEmpty)
+    }
+
+    func testToggleGroupFromPartialSelectsRest() throws {
+        let group = try decodeCategories(ids: ["A", "B"])
+        let vm = CleanViewModel()
+        vm.selectedCategoryIds = ["A"]
+        XCTAssertFalse(vm.isGroupSelected(group), "partial is not fully selected")
+        vm.toggleGroup(group)
+        XCTAssertTrue(vm.isGroupSelected(group))
+        XCTAssertEqual(vm.selectedCategoryIds, ["A", "B"])
+    }
+
+    func testToggleGroupLeavesOtherSelectionsIntact() throws {
+        let group = try decodeCategories(ids: ["A", "B"])
+        let vm = CleanViewModel()
+        vm.selectedCategoryIds = ["Z"]        // belongs to another group
+        vm.toggleGroup(group)
+        XCTAssertEqual(vm.selectedCategoryIds, ["A", "B", "Z"])
+        vm.toggleGroup(group)
+        XCTAssertEqual(vm.selectedCategoryIds, ["Z"], "clearing a group must not touch others")
+    }
+
     // MARK: - Helpers
 
     private func makeThreeFiles() throws -> [URL] {
