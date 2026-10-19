@@ -19,6 +19,14 @@ enum LoginItem {
         return status == .enabled || status == .requiresApproval
     }
 
+    static let approvalMessage = "Allow Burrow in System Settings → General → Login Items."
+
+    /// Registered but waiting for the user's approval in System Settings.
+    static var needsApproval: Bool {
+        guard #available(macOS 13.0, *) else { return false }
+        return SMAppService.mainApp.status == .requiresApproval
+    }
+
     /// Registers or unregisters; returns a message for the user when the
     /// change failed or still needs approval in System Settings.
     @discardableResult
@@ -35,7 +43,7 @@ enum LoginItem {
             return error.localizedDescription
         }
         if SMAppService.mainApp.status == .requiresApproval {
-            return "Allow Burrow in System Settings → General → Login Items."
+            return approvalMessage
         }
         return nil
     }

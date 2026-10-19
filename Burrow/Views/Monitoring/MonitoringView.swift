@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Top-level view for the Monitoring tab: live free-space readings for the
@@ -32,6 +33,11 @@ struct MonitoringView: View {
                         .monitoringFormStyle()
                 }
             }
+        }
+        // Pick up a permission change made in System Settings.
+        .task { await vm.refreshNotificationStatus() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await vm.refreshNotificationStatus() }
         }
         .padding(.horizontal, Spacing.xxl + Spacing.sm)
         .padding(.vertical, Spacing.xxl)

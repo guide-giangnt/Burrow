@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Lives in the SwiftUI `Settings` scene. macOS opens it via ⌘, or via
@@ -27,7 +28,11 @@ struct SettingsView: View {
                             .foregroundStyle(Color.fgSecondary)
                     }
                 }
-                .onAppear { openAtLogin = LoginItem.isEnabled }
+                .onAppear(perform: refreshLoginItem)
+                // Approving in System Settings happens outside the app.
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                    refreshLoginItem()
+                }
             }
 
             Section("Updates") {
@@ -60,5 +65,10 @@ struct SettingsView: View {
         }
         .frame(width: 420)
         .padding(.vertical, Spacing.md)
+    }
+
+    private func refreshLoginItem() {
+        openAtLogin = LoginItem.isEnabled
+        loginItemMessage = LoginItem.needsApproval ? LoginItem.approvalMessage : nil
     }
 }

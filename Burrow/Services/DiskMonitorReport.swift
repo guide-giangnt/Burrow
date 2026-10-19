@@ -32,6 +32,13 @@ enum DiskMonitorReport {
         let bytes: Int64
     }
 
+    /// The "Top space consumers" list, and whether app-data folders had to
+    /// be skipped because Burrow lacks Full Disk Access.
+    struct TopFolders: Equatable {
+        var folders: [Folder]
+        var limited = false
+    }
+
     static let alertColor = "#E01E5A"
     static let okColor = "#31E5C5"
 
@@ -52,7 +59,9 @@ enum DiskMonitorReport {
 
     /// Reads every path in parallel, each bounded by `timeout`, so one hung
     /// network mount is reported as unreadable instead of stalling the
-    /// check for every volume.
+    /// check for every volume. A path whose previous read is still blocked
+    /// is reported unreadable at once, so a mount that stays hung holds at
+    /// most one thread rather than one more per check.
     static func readAll(
         _ paths: [String],
         timeout: TimeInterval = 10,
@@ -61,7 +70,11 @@ enum DiskMonitorReport {
         await withTaskGroup(of: (Int, Reading).self) { group in
             for (index, path) in paths.enumerated() {
                 group.addTask {
-                    let reading = await firstOf(timeout: timeout, fallback: .unreadable(path)) { read(path) }
+                    guard pendingReads.insert(path) else { return (index, .unreadable(path)) }
+                    let reading = await firstOf(timeout: timeout, fallback: .unreadable(path)) {
+                        defer { pendingReads.remove(path) }
+                        return read(path)
+                    }
                     return (index, reading)
                 }
             }
@@ -71,9 +84,30 @@ enum DiskMonitorReport {
         }
     }
 
+    /// Paths with a read still running (possibly blocked on a hung mount).
+    private static let pendingReads = PendingReads()
+
+    private final class PendingReads: @unchecked Sendable {
+        private let lock = NSLock()
+        private var paths: Set<String> = []
+
+        /// False when `path` is already being read.
+        func insert(_ path: String) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            return paths.insert(path).inserted
+        }
+
+        func remove(_ path: String) {
+            lock.lock(); defer { lock.unlock() }
+            paths.remove(path)
+        }
+    }
+
     /// Runs blocking `work` on a background queue and returns its result, or
     /// `fallback` once `timeout` passes. A blocked call can't be interrupted;
-    /// it finishes on its own thread and its late result is dropped.
+    /// it finishes on its own thread and its late result is dropped. The
+    /// timeout runs on the Swift task pool, not GCD, so it still fires when
+    /// GCD's worker threads are all blocked.
     private static func firstOf<T: Sendable>(
         timeout: TimeInterval,
         fallback: T,
@@ -82,7 +116,10 @@ enum DiskMonitorReport {
         await withCheckedContinuation { (cont: CheckedContinuation<T, Never>) in
             let once = ResumeOnce(cont)
             DispatchQueue.global(qos: .utility).async { once.resume(work()) }
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { once.resume(fallback) }
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                once.resume(fallback)
+            }
         }
     }
 
@@ -136,7 +173,7 @@ enum DiskMonitorReport {
         host: String,
         readings: [Reading],
         threshold: Double,
-        topFolders: [Folder]?,
+        topFolders: TopFolders?,
         includeTopSection: Bool = false,
         mentions: [String],
         now: Date = Date(),
@@ -194,14 +231,22 @@ enum DiskMonitorReport {
         )
     }
 
-    static func formatTop(_ folders: [Folder]) -> String {
-        guard !folders.isEmpty else { return "*Top space consumers*\nNothing measurable found." }
-        let rows = folders.map { f -> String in
-            let size = gb(f.bytes)
-            let path = (f.path as NSString).abbreviatingWithTildeInPath
-            return String(repeating: " ", count: max(0, 9 - size.count)) + size + "  " + escape(path)
+    static func formatTop(_ top: TopFolders) -> String {
+        var text = "*Top space consumers*"
+        if top.folders.isEmpty {
+            text += "\nNothing measurable found."
+        } else {
+            let rows = top.folders.map { f -> String in
+                let size = gb(f.bytes)
+                let path = (f.path as NSString).abbreviatingWithTildeInPath
+                return String(repeating: " ", count: max(0, 9 - size.count)) + size + "  " + escape(path)
+            }
+            text += "\n```\n" + rows.joined(separator: "\n") + "\n```"
         }
-        return "*Top space consumers*\n```\n" + rows.joined(separator: "\n") + "\n```"
+        if top.limited {
+            text += "\n_App data folders (Mail, Messages, Photos, containers…) were skipped: Burrow doesn't have Full Disk Access._"
+        }
+        return text
     }
 
     /// Escapes the three characters Slack treats as markup, so a typed
@@ -214,12 +259,38 @@ enum DiskMonitorReport {
 
     // MARK: - Top folders
 
-    /// `scanFolders` bounded by `timeout`; nil when it didn't finish. The
-    /// scan runs `du` in cancellable mode, so losing the race terminates
-    /// the walk instead of leaving it running in the background.
-    static func scanTopFolders(timeout: TimeInterval = 120) async -> [Folder]? {
-        await withTaskGroup(of: [Folder]?.self) { group in
-            group.addTask { await scanFolders() }
+    /// Folders whose contents macOS guards with a privacy prompt ("access
+    /// data from other apps") — diskmon's `DefaultSkip`. An unattended scan
+    /// without Full Disk Access stays out of them. `du -I` matches basenames
+    /// at any depth, so a same-named folder elsewhere under ~ (say
+    /// ~/Pictures/Photos) is skipped too; the report notes the skip.
+    static let protectedNames = [
+        "Containers", "Group Containers", "Daemon Containers", "Application Support",
+        "Biome", "Mobile Documents", "CloudStorage", "Mail", "Messages", "Photos",
+        "Safari", "Cookies",
+    ]
+
+    /// The largest folders, bounded by `timeout`; nil when the scan didn't
+    /// finish. With Full Disk Access nothing is excluded (containers,
+    /// simulators and the Trash are what tends to fill a disk); without it,
+    /// the protected app-data folders are skipped and the report says so.
+    static func scanTopFolders(timeout: TimeInterval = 120) async -> TopFolders? {
+        let fullAccess = FullDiskAccess.probe()
+        return await withTimeout(timeout) {
+            TopFolders(folders: await scanFolders(excluding: fullAccess ? [] : protectedNames),
+                       limited: !fullAccess)
+        }
+    }
+
+    /// `work`'s result, or nil after `timeout` — at which point `work` is
+    /// cancelled. The scan runs `du` in cancellable mode, so losing the
+    /// race terminates the walk instead of leaving it running.
+    static func withTimeout<T: Sendable>(
+        _ timeout: TimeInterval,
+        _ work: @escaping @Sendable () async -> T
+    ) async -> T? {
+        await withTaskGroup(of: T?.self) { group in
+            group.addTask { await work() }
             group.addTask {
                 try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
                 return nil
@@ -232,18 +303,17 @@ enum DiskMonitorReport {
 
     /// Largest folders under the home directory: one `du` level, with the
     /// biggest few expanded one level deeper so ~/Library doesn't swallow
-    /// the whole list. Nothing is excluded (unlike Analyze): containers,
-    /// simulators and the Trash are exactly what tends to fill a disk.
-    static func scanFolders(limit: Int = 8, expand: Int = 3) async -> [Folder] {
+    /// the whole list. Unlike Analyze, only `excluding` is skipped.
+    static func scanFolders(limit: Int = 8, expand: Int = 3, excluding: [String] = []) async -> [Folder] {
         let home = URL(fileURLWithPath: NSHomeDirectory())
-        let top = await DiskUsageScanner.scan(home, excluding: [], cancellable: true)
+        let top = await DiskUsageScanner.scan(home, excluding: excluding, cancellable: true)
         guard !Task.isCancelled else { return [] }
         let first = top.children.sorted { $0.size > $1.size }
 
         var result = first.dropFirst(expand).map { Folder(path: $0.url.path, bytes: $0.size) }
         result += looseFiles(in: home.path, total: top.total, children: top.children.map(\.size))
         for entry in first.prefix(expand) {
-            let deeper = await DiskUsageScanner.scan(entry.url, excluding: [], cancellable: true)
+            let deeper = await DiskUsageScanner.scan(entry.url, excluding: excluding, cancellable: true)
             guard !Task.isCancelled else { return [] }
             if deeper.children.isEmpty {
                 result.append(Folder(path: entry.url.path, bytes: entry.size))

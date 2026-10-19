@@ -52,9 +52,9 @@ enum DiskUsageScanner {
 
     /// Run `du -d 1 -k` on `url`: the folder's recursive total plus its
     /// immediate subdirectories with sizes. Basenames in `excluding` are
-    /// pruned (Analyze's list by default; the disk monitor passes none, since
-    /// those folders are often what fills the disk). With `cancellable`, a
-    /// cancelled task terminates `du` instead of waiting for the walk.
+    /// pruned at any depth (Analyze's list by default; the disk monitor
+    /// passes its own). With `cancellable`, a cancelled task terminates
+    /// `du` instead of waiting for the walk.
     static func scan(_ url: URL, excluding: [String] = excludedNames, cancellable: Bool = false) async -> FolderScan {
         var args = ["-d", "1", "-k"]
         for name in excluding { args.append(contentsOf: ["-I", name]) }
@@ -98,6 +98,9 @@ enum DiskUsageScanner {
             }
             do {
                 try process.run()
+                // A cancel that landed between the check above and run()
+                // found nothing to terminate; catch it here.
+                if Task.isCancelled { process.terminate() }
             } catch {
                 logger.error("du launch failed: \(error.localizedDescription, privacy: .public)")
                 cont.resume(returning: nil)

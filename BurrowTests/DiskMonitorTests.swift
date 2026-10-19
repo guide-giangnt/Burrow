@@ -167,7 +167,7 @@ final class DiskMonitorTests: XCTestCase {
         let low = Reading(path: "/", total: 500 * gb, free: 20 * gb, failed: false)
         let msg = DiskMonitorReport.message(
             host: "Build Mac", readings: [low], threshold: 7.5,
-            topFolders: [.init(path: NSHomeDirectory() + "/Library", bytes: 40 * gb)],
+            topFolders: .init(folders: [.init(path: NSHomeDirectory() + "/Library", bytes: 40 * gb)]),
             mentions: ["U01", "S02"]
         )
         // Mentions in the top-level text, where Slack notifies for them.
@@ -210,7 +210,14 @@ final class DiskMonitorTests: XCTestCase {
         let timedOut = DiskMonitorReport.message(host: "M", readings: [low], threshold: 10,
                                                  topFolders: nil, includeTopSection: true, mentions: [])
         XCTAssertTrue(try XCTUnwrap(timedOut.attachments.first).blocks[1].mrkdwn.contains("didn't finish"))
-        XCTAssertEqual(DiskMonitorReport.formatTop([]), "*Top space consumers*\nNothing measurable found.")
+        XCTAssertEqual(DiskMonitorReport.formatTop(.init(folders: [])), "*Top space consumers*\nNothing measurable found.")
+    }
+
+    func testTopSectionSaysWhenAppDataWasSkipped() {
+        let limited = DiskMonitorReport.formatTop(.init(folders: [.init(path: "/x", bytes: gb)], limited: true))
+        XCTAssertTrue(limited.contains("Full Disk Access"))
+        XCTAssertFalse(DiskMonitorReport.formatTop(.init(folders: [.init(path: "/x", bytes: gb)])).contains("Full Disk Access"))
+        XCTAssertTrue(DiskMonitorReport.protectedNames.contains("Containers"))
     }
 
     func testLooseFilesRowAndRanking() {
@@ -221,7 +228,7 @@ final class DiskMonitorTests: XCTestCase {
 
         let ranked = DiskMonitorReport.rank(loose + [.init(path: "/Users/a/Downloads/sub", bytes: 1 * gb)], limit: 1)
         XCTAssertEqual(ranked.map(\.path), ["/Users/a/Downloads/*"])
-        XCTAssertTrue(DiskMonitorReport.formatTop(loose).contains("44.0 GB  /Users/a/Downloads/*"))
+        XCTAssertTrue(DiskMonitorReport.formatTop(.init(folders: loose)).contains("44.0 GB  /Users/a/Downloads/*"))
     }
 
     func testEveryMessageEndsWithBurrowSignature() throws {
@@ -260,18 +267,49 @@ final class DiskMonitorTests: XCTestCase {
         XCTAssertEqual(DiskMonitorViewModel.explain(SlackClient.SlackError.api("weird")), "Slack error: weird.")
     }
 
-    // MARK: - Reading volumes
+    // MARK: - Reading volumes & timeouts
 
     func testHungVolumeTimesOutAsUnreadableWithoutBlockingOthers() async {
         let gb = self.gb
-        let start = Date()
-        let readings = await DiskMonitorReport.readAll(["/", "/Volumes/Hung", "/Volumes/B"], timeout: 0.2) { path in
-            if path == "/Volumes/Hung" { Thread.sleep(forTimeInterval: 2) }
+        let hung = "/Volumes/Hung-\(UUID().uuidString)"
+        let read: @Sendable (String) -> Reading = { path in
+            if path == hung { Thread.sleep(forTimeInterval: 3) }
             return Reading(path: path, total: 100 * gb, free: 50 * gb, failed: false)
         }
-        XCTAssertLessThan(Date().timeIntervalSince(start), 1.5)
-        XCTAssertEqual(readings.map(\.path), ["/", "/Volumes/Hung", "/Volumes/B"])
+        let start = Date()
+        let readings = await DiskMonitorReport.readAll(["/", hung, "/Volumes/B"], timeout: 0.2, read: read)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 2.5)
+        XCTAssertEqual(readings.map(\.path), ["/", hung, "/Volumes/B"])
         XCTAssertEqual(readings.map(\.failed), [false, true, false])
+
+        // Still hung: reported at once, without blocking another thread.
+        let again = Date()
+        let second = await DiskMonitorReport.readAll([hung], timeout: 2, read: read)
+        XCTAssertEqual(second.map(\.failed), [true])
+        XCTAssertLessThan(Date().timeIntervalSince(again), 1)
+    }
+
+    func testWithTimeoutCancelsSlowWork() async {
+        let start = Date()
+        let result: Int? = await DiskMonitorReport.withTimeout(0.1) {
+            while !Task.isCancelled { try? await Task.sleep(nanoseconds: 10_000_000) }
+            return 1
+        }
+        XCTAssertNil(result)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 2)
+        let fast: Int? = await DiskMonitorReport.withTimeout(5) { 7 }
+        XCTAssertEqual(fast, 7)
+    }
+
+    func testCancellableDuIsTerminated() async {
+        // /System/Library takes many seconds to walk and needs no privacy
+        // permission; a cancelled cancellable scan must return right away.
+        let start = Date()
+        let task = Task { await DiskUsageScanner.scan(URL(fileURLWithPath: "/System/Library"), excluding: [], cancellable: true) }
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        task.cancel()
+        _ = await task.value
+        XCTAssertLessThan(Date().timeIntervalSince(start), 3)
     }
 
     // MARK: - check()
@@ -280,10 +318,30 @@ final class DiskMonitorTests: XCTestCase {
         var posts: [(SlackClient.Message, String, String)] = []
         var notifications = 0
         var deliver = true
+        var denied = false
+        var notifyDelay: UInt64 = 0
+        var notifyStarted = false
+        var authorizeHangs = false
         var scans = 0
         var free: [String: Int64] = [:]
         var postDelay: UInt64 = 0
         var scanDelay: UInt64 = 0
+        var now = Date()
+    }
+
+    /// Polls until `condition` holds (or 5 s pass) instead of sleeping a
+    /// fixed time, so slow machines don't make these tests flaky.
+    @MainActor
+    private func waitUntil(_ condition: () -> Bool) async {
+        let deadline = Date().addingTimeInterval(5)
+        while !condition() && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    /// For "nothing more happens" assertions, after the expected work is done.
+    private func settle() async {
+        try? await Task.sleep(nanoseconds: 300_000_000)
     }
 
     @MainActor
@@ -307,17 +365,24 @@ final class DiskMonitorTests: XCTestCase {
         deps.scanTopFolders = {
             spy.scans += 1
             if spy.scanDelay > 0 { try? await Task.sleep(nanoseconds: spy.scanDelay) }
-            return []
+            return .init(folders: [])
         }
         deps.post = { msg, token, channel in
             if spy.postDelay > 0 { try await Task.sleep(nanoseconds: spy.postDelay) }
             spy.posts.append((msg, token, channel))
         }
-        deps.authorize = { true }
+        deps.authorize = {
+            if spy.authorizeHangs { try? await Task.sleep(nanoseconds: 60_000_000_000) }
+            return true
+        }
+        deps.notificationsDenied = { spy.denied }
         deps.notify = { _, _ in
+            spy.notifyStarted = true
+            if spy.notifyDelay > 0 { try? await Task.sleep(nanoseconds: spy.notifyDelay) }
             spy.notifications += 1
             return spy.deliver
         }
+        deps.now = { spy.now }
 
         // Stored `enabled` doesn't start a timer: only start() or toggling does.
         let vm = DiskMonitorViewModel(defaults: defaults, keychain: kc, dependencies: deps, recheckDelay: 10_000_000)
@@ -366,31 +431,59 @@ final class DiskMonitorTests: XCTestCase {
     }
 
     @MainActor
-    func testUndeliveredNotificationIsRetriedNextCheck() async throws {
+    func testUndeliveredNotificationIsRetriedAndDenialShown() async throws {
         let spy = Spy()
         spy.free["/"] = 5 * gb
         spy.deliver = false   // e.g. permission not granted yet
+        spy.denied = true
         let (vm, cleanup) = try makeVM(spy) { _ in }
         defer { cleanup() }
 
         await vm.check()
+        XCTAssertTrue(vm.notificationsDenied)
+
         spy.deliver = true
+        spy.denied = false
         await vm.check()
         await vm.check()
         XCTAssertEqual(spy.notifications, 2)   // retried once, then quiet
+        await vm.refreshNotificationStatus()
+        XCTAssertFalse(vm.notificationsDenied)
     }
 
     @MainActor
-    func testTopFoldersAreReusedWhileFresh() async throws {
+    func testUnansweredPermissionPromptDoesNotStopMonitoring() async throws {
+        let spy = Spy()
+        spy.authorizeHangs = true   // the user never answers the prompt
+        let (vm, cleanup) = try makeVM(spy) { $0.alertOnly = false }
+        defer { cleanup() }
+
+        vm.settings.enabled = true
+        await waitUntil { spy.posts.count == 1 }
+        XCTAssertEqual(spy.posts.count, 1)
+        XCTAssertNotNil(vm.nextCheck)
+        vm.settings.enabled = false
+    }
+
+    @MainActor
+    func testTopFoldersCacheReusedThenRefreshed() async throws {
         let spy = Spy()
         spy.free["/"] = 5 * gb
-        let (vm, cleanup) = try makeVM(spy) { _ in }
+        let (vm, cleanup) = try makeVM(spy) { $0.paths = ["/", "/Volumes/B"] }
         defer { cleanup() }
 
         await vm.check()
         await vm.check()
-        XCTAssertEqual(spy.posts.count, 2)
-        XCTAssertEqual(spy.scans, 1)
+        XCTAssertEqual(spy.scans, 1)            // fresh: reused
+
+        spy.free["/Volumes/B"] = 1 * gb
+        await vm.check()
+        XCTAssertEqual(spy.scans, 2)            // a new disk turned low
+
+        spy.now = spy.now.addingTimeInterval(2 * 3600)
+        await vm.check()
+        XCTAssertEqual(spy.scans, 3)            // older than an hour
+        XCTAssertEqual(spy.posts.count, 4)
     }
 
     @MainActor
@@ -415,7 +508,8 @@ final class DiskMonitorTests: XCTestCase {
 
         vm.settings.thresholdPercent = 20
         vm.settings.thresholdPercent = 30   // debounced: one report, with 30
-        try await Task.sleep(nanoseconds: 300_000_000)
+        await waitUntil { spy.posts.count >= 1 }
+        await settle()
 
         XCTAssertEqual(spy.posts.count, 1)
         let attachment = try XCTUnwrap(spy.posts.first?.0.attachments.first)
@@ -428,16 +522,16 @@ final class DiskMonitorTests: XCTestCase {
     func testRecheckDuringRunningCheckRunsAfterwards() async throws {
         let spy = Spy()
         spy.free["/"] = 26 * gb
-        spy.postDelay = 200_000_000   // a slow Slack post keeps the first check busy
+        spy.postDelay = 300_000_000   // a slow Slack post keeps the first check busy
         let (vm, cleanup) = try makeVM(spy) { $0.enabled = true; $0.alertOnly = false }
         defer { cleanup() }
 
         let first = Task { await vm.check() }
-        try await Task.sleep(nanoseconds: 50_000_000)
+        await waitUntil { vm.isChecking }
         XCTAssertTrue(vm.isChecking)
         vm.settings.thresholdPercent = 30   // must not be dropped while busy
         await first.value
-        try await Task.sleep(nanoseconds: 500_000_000)
+        await waitUntil { spy.posts.count == 2 }
 
         XCTAssertEqual(spy.posts.count, 2)
         XCTAssertTrue(try XCTUnwrap(spy.posts.last?.0.attachments.first).blocks[0].mrkdwn.contains("threshold 30%"))
@@ -447,35 +541,77 @@ final class DiskMonitorTests: XCTestCase {
     func testDisablingDuringScanPostsNothing() async throws {
         let spy = Spy()
         spy.free["/"] = 5 * gb
-        spy.scanDelay = 200_000_000
+        spy.scanDelay = 300_000_000
         let (vm, cleanup) = try makeVM(spy) { $0.enabled = true }
         defer { cleanup() }
 
         let running = Task { await vm.check() }
-        try await Task.sleep(nanoseconds: 50_000_000)
+        await waitUntil { spy.scans == 1 }
         vm.settings.enabled = false   // mid-scan
         await running.value
+        await settle()
 
         XCTAssertTrue(spy.posts.isEmpty)
         XCTAssertTrue(vm.lastReadings.isEmpty, "a stale check must not restore state reset by disable")
     }
 
     @MainActor
+    func testQueuedCheckIsDroppedWhenDisabled() async throws {
+        let spy = Spy()
+        spy.free["/"] = 5 * gb
+        spy.scanDelay = 300_000_000
+        let (vm, cleanup) = try makeVM(spy) { $0.enabled = true }
+        defer { cleanup() }
+
+        let running = Task { await vm.check() }
+        await waitUntil { spy.scans == 1 }
+        await vm.check()              // queued behind the running one
+        vm.settings.enabled = false
+        await running.value
+        await settle()
+
+        XCTAssertEqual(spy.scans, 1)
+        XCTAssertTrue(spy.posts.isEmpty)
+    }
+
+    @MainActor
     func testRescheduleDuringRecheckStillReports() async throws {
         let spy = Spy()
         spy.free["/"] = 5 * gb
-        spy.scanDelay = 200_000_000
+        spy.scanDelay = 300_000_000
         let (vm, cleanup) = try makeVM(spy) { $0.enabled = true }
         defer { cleanup() }
 
         vm.settings.thresholdPercent = 15             // recheck starts after 10 ms
-        try await Task.sleep(nanoseconds: 50_000_000)  // …and is now scanning
+        await waitUntil { spy.scans == 1 }           // …and is now scanning
         vm.settings.intervalMinutes = 30              // reschedule mid-check
-        try await Task.sleep(nanoseconds: 800_000_000)
+        await waitUntil { spy.posts.count == 1 }
+        await settle()
 
         // The interrupted check is superseded, not lost: one report arrives.
         XCTAssertEqual(spy.posts.count, 1)
         XCTAssertTrue(try XCTUnwrap(spy.posts.first?.0.attachments.first).blocks[0].mrkdwn.contains("threshold 15%"))
+        vm.settings.enabled = false
+    }
+
+    @MainActor
+    func testNotificationDeliveredBeforeRescheduleIsNotRepeated() async throws {
+        let spy = Spy()
+        spy.free["/"] = 5 * gb
+        spy.notifyDelay = 300_000_000
+        let (vm, cleanup) = try makeVM(spy) { $0.enabled = true }
+        defer { cleanup() }
+
+        let running = Task { await vm.check() }
+        await waitUntil { spy.notifyStarted }            // inside notify
+        vm.settings.intervalMinutes = 30                 // reschedule while notifying
+        await running.value
+        await waitUntil { spy.notifications >= 1 && !vm.isChecking }
+        await settle()
+        await vm.check()
+
+        XCTAssertEqual(spy.notifications, 1, "the delivered alert must not be shown again")
+        vm.settings.enabled = false
     }
 
     @MainActor
@@ -488,9 +624,11 @@ final class DiskMonitorTests: XCTestCase {
         vm.settings.thresholdPercent = 30   // recheck pending for 10 ms
         vm.settings.enabled = false         // cancels it…
         vm.settings.enabled = true          // …and the new timer checks once
-        try await Task.sleep(nanoseconds: 300_000_000)
+        await waitUntil { spy.posts.count >= 1 }
+        await settle()
 
         XCTAssertEqual(spy.posts.count, 1)
+        vm.settings.enabled = false
     }
 
     @MainActor
@@ -500,15 +638,15 @@ final class DiskMonitorTests: XCTestCase {
         defer { cleanup() }
 
         vm.settings.enabled = true   // timer: one check now, next in 60 min
-        try await Task.sleep(nanoseconds: 200_000_000)
+        await waitUntil { spy.posts.count == 1 }
         XCTAssertEqual(spy.posts.count, 1)
 
         vm.handleWake(now: Date().addingTimeInterval(30 * 60))   // not due yet
-        try await Task.sleep(nanoseconds: 200_000_000)
+        await settle()
         XCTAssertEqual(spy.posts.count, 1)
 
         vm.handleWake(now: Date().addingTimeInterval(2 * 3600))  // overdue after sleep
-        try await Task.sleep(nanoseconds: 200_000_000)
+        await waitUntil { spy.posts.count == 2 }
         XCTAssertEqual(spy.posts.count, 2)
         vm.settings.enabled = false
     }

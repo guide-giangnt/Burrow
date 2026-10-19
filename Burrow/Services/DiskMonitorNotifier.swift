@@ -21,6 +21,11 @@ final class DiskMonitorNotifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
+    /// True when the user turned Burrow's notifications off. Never prompts.
+    static func isDenied() async -> Bool {
+        await UNUserNotificationCenter.current().notificationSettings().authorizationStatus == .denied
+    }
+
     /// Posts the low-disk notification; false when it couldn't be shown
     /// (not authorized yet, or rejected), so the caller retries later.
     static func notify(_ readings: [DiskMonitorReport.Reading], threshold: Double) async -> Bool {

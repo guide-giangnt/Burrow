@@ -15,12 +15,16 @@ final class DiskMonitorViewModel: ObservableObject {
     /// Side effects, swappable in tests.
     struct Dependencies {
         var readAll: ([String]) async -> [DiskMonitorReport.Reading] = { await DiskMonitorReport.readAll($0) }
-        var scanTopFolders: () async -> [DiskMonitorReport.Folder]? = { await DiskMonitorReport.scanTopFolders() }
+        var scanTopFolders: () async -> DiskMonitorReport.TopFolders? = { await DiskMonitorReport.scanTopFolders() }
         var post: (SlackClient.Message, _ token: String, _ channel: String) async throws -> Void = { message, token, channel in
             try await SlackClient(token: token).post(message, to: channel)
         }
-        /// Asks for notification permission; true when banners may be shown.
+        /// Asks for notification permission (may show the system prompt);
+        /// true when banners may be shown.
         var authorize: () async -> Bool = { await DiskMonitorNotifier.authorize() }
+        /// Reads, without prompting, whether the user turned notifications off.
+        var notificationsDenied: () async -> Bool = { await DiskMonitorNotifier.isDenied() }
+        var now: () -> Date = { Date() }
         /// Shows the low-disk notification; true when it was delivered.
         var notify: ([DiskMonitorReport.Reading], Double) async -> Bool = { await DiskMonitorNotifier.notify($0, threshold: $1) }
     }
@@ -69,7 +73,7 @@ final class DiskMonitorViewModel: ObservableObject {
     /// notification fires when this set grows; a path is only added once
     /// the notification was actually delivered.
     private var alertingPaths: Set<String> = []
-    private var topFoldersCache: (date: Date, alerting: Set<String>, folders: [DiskMonitorReport.Folder])?
+    private var topFoldersCache: (date: Date, alerting: Set<String>, top: DiskMonitorReport.TopFolders)?
     private var wakeObserver: NSObjectProtocol?
 
     init(defaults: UserDefaults = .standard, keychain: Keychain = .slack,
@@ -123,10 +127,15 @@ final class DiskMonitorViewModel: ObservableObject {
         }
         // Only while monitoring: no Keychain access on launch when it's off.
         refreshSlackToken()
+        // Ask in parallel, never awaited by the timer: the system prompt only
+        // returns once the user answers, and an ignored prompt must not stop
+        // monitoring. A first alert sent before the answer isn't delivered,
+        // so it is retried on the next check.
+        Task { [weak self] in
+            guard let self else { return }
+            self.notificationsDenied = !(await self.deps.authorize())
+        }
         loop = Task { [weak self] in
-            // Ask before the first check, so its notification isn't dropped
-            // while permission is still undetermined.
-            if let self { await self.updateAuthorization() }
             while !Task.isCancelled {
                 let minutes: Int
                 do {
@@ -157,8 +166,10 @@ final class DiskMonitorViewModel: ObservableObject {
         }
     }
 
-    private func updateAuthorization() async {
-        notificationsDenied = !(await deps.authorize())
+    /// Re-reads the notification permission (no prompt), e.g. when the
+    /// user comes back from System Settings.
+    func refreshNotificationStatus() async {
+        notificationsDenied = await deps.notificationsDenied()
     }
 
     // MARK: - Checking
@@ -207,7 +218,10 @@ final class DiskMonitorViewModel: ObservableObject {
             // Undelivered (e.g. permission not granted yet): keep the new
             // paths out, so the next check tries again.
             alertingPaths = delivered ? alerting : alerting.intersection(alertingPaths)
-            if !delivered { await updateAuthorization() }
+            if !delivered {
+                await refreshNotificationStatus()
+                guard gen == generation else { return }
+            }
         }
 
         let alert = !alerting.isEmpty
@@ -229,15 +243,15 @@ final class DiskMonitorViewModel: ObservableObject {
 
     /// The cached list while it's fresh and no new path became low;
     /// otherwise a new (time-bounded) scan.
-    private func topFolders(alerting: Set<String>) async -> [DiskMonitorReport.Folder]? {
+    private func topFolders(alerting: Set<String>) async -> DiskMonitorReport.TopFolders? {
         if let cache = topFoldersCache,
-           Date().timeIntervalSince(cache.date) < Self.topFoldersMaxAge,
+           deps.now().timeIntervalSince(cache.date) < Self.topFoldersMaxAge,
            alerting.isSubset(of: cache.alerting) {
-            return cache.folders
+            return cache.top
         }
-        let folders = await deps.scanTopFolders()
-        if let folders { topFoldersCache = (Date(), alerting, folders) }
-        return folders
+        let top = await deps.scanTopFolders()
+        if let top { topFoldersCache = (deps.now(), alerting, top) }
+        return top
     }
 
     /// "Send Test Message" — verifies token, channel and bot membership.
