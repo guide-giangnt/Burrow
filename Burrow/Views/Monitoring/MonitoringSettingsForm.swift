@@ -10,6 +10,11 @@ struct MonitoringGeneralSection: View {
     @State private var thresholdError: String?
     @State private var pathsDraft = ""
     @State private var nameDraft = ""
+    @State private var nameSave: Task<Void, Never>?
+    /// The name as loaded into this view. Only a draft that differs from it
+    /// was typed here, so an untouched draft (e.g. in a second window) never
+    /// overwrites a name saved elsewhere.
+    @State private var nameLoaded = ""
 
     var body: some View {
         Section("Disk Monitor") {
@@ -51,10 +56,12 @@ struct MonitoringGeneralSection: View {
                     Button("Set", action: applyPaths)
                 }
 
-                // A draft, saved on Return or when leaving the tab — not a
-                // UserDefaults write per keystroke.
+                // A draft, saved shortly after typing stops (and on Return or
+                // leaving the tab) — not a UserDefaults write per keystroke,
+                // yet not lost if the app quits right away.
                 TextField("Name in reports", text: $nameDraft, prompt: Text(DiskMonitorSettings.computerName))
                     .onSubmit(applyName)
+                    .onChange(of: nameDraft) { _ in scheduleNameSave() }
 
                 Toggle("Show in menu bar", isOn: $vm.settings.showInMenuBar)
 
@@ -69,6 +76,7 @@ struct MonitoringGeneralSection: View {
         .onAppear {
             pathsDraft = vm.settings.paths.joined(separator: ", ")
             nameDraft = vm.settings.machineName
+            nameLoaded = nameDraft
         }
         .onDisappear(perform: applyName)
     }
@@ -88,7 +96,19 @@ struct MonitoringGeneralSection: View {
     }
 
     private func applyName() {
+        nameSave?.cancel()
+        guard nameDraft != nameLoaded else { return }
         vm.settings.machineName = nameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        nameLoaded = nameDraft
+    }
+
+    private func scheduleNameSave() {
+        nameSave?.cancel()
+        nameSave = Task {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard !Task.isCancelled else { return }
+            applyName()
+        }
     }
 
     private func intervalLabel(_ minutes: Int) -> String {

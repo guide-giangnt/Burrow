@@ -54,9 +54,12 @@ enum DiskUsageScanner {
     /// immediate subdirectories with sizes. Basenames in `excluding` are
     /// pruned at any depth (Analyze's list by default; the disk monitor
     /// passes its own). With `cancellable`, a cancelled task terminates
-    /// `du` instead of waiting for the walk.
-    static func scan(_ url: URL, excluding: [String] = excludedNames, cancellable: Bool = false) async -> FolderScan {
+    /// `du` instead of waiting for the walk. With `sameVolume`, `du -x`
+    /// stays on `url`'s volume instead of descending into mounts under it.
+    static func scan(_ url: URL, excluding: [String] = excludedNames, cancellable: Bool = false,
+                     sameVolume: Bool = false) async -> FolderScan {
         var args = ["-d", "1", "-k"]
+        if sameVolume { args.append("-x") }
         for name in excluding { args.append(contentsOf: ["-I", name]) }
         args.append(url.standardizedFileURL.path)
 

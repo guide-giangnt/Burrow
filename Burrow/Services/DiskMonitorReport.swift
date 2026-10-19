@@ -115,10 +115,13 @@ enum DiskMonitorReport {
     ) async -> T {
         await withCheckedContinuation { (cont: CheckedContinuation<T, Never>) in
             let once = ResumeOnce(cont)
-            DispatchQueue.global(qos: .utility).async { once.resume(work()) }
-            Task {
+            let timer = Task {
                 try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
                 once.resume(fallback)
+            }
+            DispatchQueue.global(qos: .utility).async {
+                once.resume(work())
+                timer.cancel()
             }
         }
     }
@@ -159,6 +162,12 @@ enum DiskMonitorReport {
         value.formatted(.number.precision(.fractionLength(0...1)).locale(Locale(identifier: "en_US_POSIX")))
     }
 
+    /// The threshold everywhere it's shown (Slack, picker, menu): two
+    /// decimals at most, so a custom 7.25 reads the same in every place.
+    static func threshold(_ value: Double) -> String {
+        value.formatted(.number.precision(.fractionLength(0...2)).locale(Locale(identifier: "en_US_POSIX"))) + "%"
+    }
+
     private static let stampFormatter: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
@@ -190,7 +199,7 @@ enum DiskMonitorReport {
             }
             let state = r.isLow(threshold: threshold) ? ", *below threshold*" : ""
             lines.append("Free space `\(escape(r.path))`: *\(gb(r.free))* of \(gb(r.total)) "
-                + "(\(percent(r.freePercent))% free, threshold \(percent(threshold))%\(state))")
+                + "(\(percent(r.freePercent))% free, threshold \(Self.threshold(threshold))\(state))")
         }
         if alert { lines.append("The disk is running low - this needs a look.") }
         lines.append("Checked: \(stampFormatter.string(from: now))")
@@ -268,7 +277,13 @@ enum DiskMonitorReport {
         "Containers", "Group Containers", "Daemon Containers", "Application Support",
         "Biome", "Mobile Documents", "CloudStorage", "Mail", "Messages", "Photos",
         "Safari", "Cookies",
+        // Per-folder privacy prompts ("access files in your Documents folder").
+        "Desktop", "Documents", "Downloads", "Photos Library.photoslibrary",
     ]
+
+    /// Skipped even with Full Disk Access, as diskmon does: File Provider
+    /// folders (iCloud Drive, Dropbox…) whose walk can hit the network.
+    static let cloudNames = ["Mobile Documents", "CloudStorage"]
 
     /// The largest folders, bounded by `timeout`; nil when the scan didn't
     /// finish. With Full Disk Access nothing is excluded (containers,
@@ -277,7 +292,7 @@ enum DiskMonitorReport {
     static func scanTopFolders(timeout: TimeInterval = 120) async -> TopFolders? {
         let fullAccess = FullDiskAccess.probe()
         return await withTimeout(timeout) {
-            TopFolders(folders: await scanFolders(excluding: fullAccess ? [] : protectedNames),
+            TopFolders(folders: await scanFolders(excluding: fullAccess ? cloudNames : protectedNames),
                        limited: !fullAccess)
         }
     }
@@ -306,14 +321,14 @@ enum DiskMonitorReport {
     /// the whole list. Unlike Analyze, only `excluding` is skipped.
     static func scanFolders(limit: Int = 8, expand: Int = 3, excluding: [String] = []) async -> [Folder] {
         let home = URL(fileURLWithPath: NSHomeDirectory())
-        let top = await DiskUsageScanner.scan(home, excluding: excluding, cancellable: true)
+        let top = await DiskUsageScanner.scan(home, excluding: excluding, cancellable: true, sameVolume: true)
         guard !Task.isCancelled else { return [] }
         let first = top.children.sorted { $0.size > $1.size }
 
         var result = first.dropFirst(expand).map { Folder(path: $0.url.path, bytes: $0.size) }
         result += looseFiles(in: home.path, total: top.total, children: top.children.map(\.size))
         for entry in first.prefix(expand) {
-            let deeper = await DiskUsageScanner.scan(entry.url, excluding: excluding, cancellable: true)
+            let deeper = await DiskUsageScanner.scan(entry.url, excluding: excluding, cancellable: true, sameVolume: true)
             guard !Task.isCancelled else { return [] }
             if deeper.children.isEmpty {
                 result.append(Folder(path: entry.url.path, bytes: entry.size))

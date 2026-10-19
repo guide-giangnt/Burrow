@@ -190,6 +190,24 @@ final class DiskMonitorTests: XCTestCase {
         XCTAssertEqual(attachment.blocks.count, 2)
     }
 
+    func testThresholdShownTheSameEverywhere() {
+        XCTAssertEqual(DiskMonitorReport.threshold(7.25), "7.25%")
+        XCTAssertEqual(DiskMonitorReport.threshold(10), "10%")
+        XCTAssertEqual(MenuBarFormat.percent(7.25), DiskMonitorReport.threshold(7.25))
+        let low = Reading(path: "/", total: 100 * gb, free: 5 * gb, failed: false)
+        let msg = DiskMonitorReport.message(host: "M", readings: [low], threshold: 7.25, topFolders: nil, mentions: [])
+        XCTAssertTrue(msg.attachments[0].blocks[0].mrkdwn.contains("threshold 7.25%"))
+    }
+
+    func testScanSkipListsWithAndWithoutFullDiskAccess() {
+        for name in ["Containers", "Mail", "Documents", "Desktop", "Downloads", "Photos Library.photoslibrary"] {
+            XCTAssertTrue(DiskMonitorReport.protectedNames.contains(name), name)
+        }
+        // File Provider folders are skipped even with Full Disk Access.
+        XCTAssertTrue(Set(DiskMonitorReport.cloudNames).isSubset(of: Set(DiskMonitorReport.protectedNames)))
+        XCTAssertEqual(Set(DiskMonitorReport.cloudNames), ["Mobile Documents", "CloudStorage"])
+    }
+
     func testPercentFormatIsLocaleFree() {
         XCTAssertEqual(DiskMonitorReport.percent(7.5), "7.5")
         XCTAssertEqual(DiskMonitorReport.percent(10), "10")
@@ -322,10 +340,14 @@ final class DiskMonitorTests: XCTestCase {
         var notifyDelay: UInt64 = 0
         var notifyStarted = false
         var authorizeHangs = false
+        var authorizeDelay: UInt64 = 0
+        var granted = true
         var scans = 0
         var free: [String: Int64] = [:]
         var postDelay: UInt64 = 0
         var scanDelay: UInt64 = 0
+        var readDelay: UInt64 = 0
+        var reads = 0
         var now = Date()
     }
 
@@ -360,7 +382,9 @@ final class DiskMonitorTests: XCTestCase {
         var deps = DiskMonitorViewModel.Dependencies()
         let total = 100 * gb
         deps.readAll = { paths in
-            paths.map { Reading(path: $0, total: total, free: spy.free[$0] ?? 50 * total / 100, failed: false) }
+            spy.reads += 1
+            if spy.readDelay > 0 { try? await Task.sleep(nanoseconds: spy.readDelay) }
+            return paths.map { Reading(path: $0, total: total, free: spy.free[$0] ?? 50 * total / 100, failed: false) }
         }
         deps.scanTopFolders = {
             spy.scans += 1
@@ -373,7 +397,8 @@ final class DiskMonitorTests: XCTestCase {
         }
         deps.authorize = {
             if spy.authorizeHangs { try? await Task.sleep(nanoseconds: 60_000_000_000) }
-            return true
+            if spy.authorizeDelay > 0 { try? await Task.sleep(nanoseconds: spy.authorizeDelay) }
+            return spy.granted
         }
         deps.notificationsDenied = { spy.denied }
         deps.notify = { _, _ in
@@ -385,7 +410,8 @@ final class DiskMonitorTests: XCTestCase {
         deps.now = { spy.now }
 
         // Stored `enabled` doesn't start a timer: only start() or toggling does.
-        let vm = DiskMonitorViewModel(defaults: defaults, keychain: kc, dependencies: deps, recheckDelay: 10_000_000)
+        let vm = DiskMonitorViewModel(defaults: defaults, keychain: kc, dependencies: deps,
+                                      recheckDelay: 10_000_000, timerSlice: 0.02)
         return (vm, { kc.delete("bot-token"); defaults.removePersistentDomain(forName: suite) })
     }
 
@@ -449,6 +475,38 @@ final class DiskMonitorTests: XCTestCase {
         XCTAssertEqual(spy.notifications, 2)   // retried once, then quiet
         await vm.refreshNotificationStatus()
         XCTAssertFalse(vm.notificationsDenied)
+    }
+
+    @MainActor
+    func testGrantingPermissionDeliversTheHeldBackAlertRightAway() async throws {
+        let spy = Spy()
+        spy.free["/"] = 5 * gb
+        spy.deliver = false            // not authorized while the prompt is open
+        spy.authorizeDelay = 300_000_000
+        let (vm, cleanup) = try makeVM(spy) { $0.intervalMinutes = 360 }
+        defer { cleanup() }
+
+        vm.settings.enabled = true
+        await waitUntil { spy.notifications == 1 }
+        spy.deliver = true             // the user clicks Allow…
+        await waitUntil { spy.notifications == 2 }   // …and it's shown now, not in 6 h
+
+        XCTAssertEqual(spy.notifications, 2)
+        vm.settings.enabled = false
+    }
+
+    @MainActor
+    func testFailedPermissionRequestIsNotShownAsDenied() async throws {
+        let spy = Spy()
+        spy.granted = false            // request failed (e.g. unsigned build)…
+        spy.denied = false             // …but the user never turned them off
+        let (vm, cleanup) = try makeVM(spy) { _ in }
+        defer { cleanup() }
+
+        vm.settings.enabled = true
+        await settle()
+        XCTAssertFalse(vm.notificationsDenied)
+        vm.settings.enabled = false
     }
 
     @MainActor
@@ -553,6 +611,61 @@ final class DiskMonitorTests: XCTestCase {
 
         XCTAssertTrue(spy.posts.isEmpty)
         XCTAssertTrue(vm.lastReadings.isEmpty, "a stale check must not restore state reset by disable")
+    }
+
+    @MainActor
+    func testDisablingDuringVolumeReadPostsNothing() async throws {
+        let spy = Spy()
+        spy.free["/"] = 5 * gb
+        spy.readDelay = 300_000_000
+        let (vm, cleanup) = try makeVM(spy) { $0.enabled = true }
+        defer { cleanup() }
+
+        let running = Task { await vm.check() }
+        await waitUntil { spy.reads == 1 }
+        vm.settings.enabled = false   // mid-read
+        await running.value
+        await settle()
+
+        XCTAssertTrue(spy.posts.isEmpty)
+        XCTAssertEqual(spy.notifications, 0)
+        XCTAssertTrue(vm.lastReadings.isEmpty, "a stale read must not restore state reset by disable")
+    }
+
+    @MainActor
+    func testStaleScanDoesNotRefillTheCache() async throws {
+        let spy = Spy()
+        spy.free["/"] = 5 * gb
+        spy.scanDelay = 300_000_000
+        let (vm, cleanup) = try makeVM(spy) { $0.enabled = true }
+        defer { cleanup() }
+
+        let running = Task { await vm.check() }
+        await waitUntil { spy.scans == 1 }
+        vm.settings.enabled = false   // reset while scanning
+        await running.value
+        vm.settings.enabled = true    // new timer: its check must scan again
+        await waitUntil { spy.scans == 2 }
+
+        XCTAssertEqual(spy.scans, 2)
+        vm.settings.enabled = false
+    }
+
+    @MainActor
+    func testTimerCountsWallClockTime() async throws {
+        let spy = Spy()
+        let (vm, cleanup) = try makeVM(spy) { $0.alertOnly = false; $0.intervalMinutes = 60 }
+        defer { cleanup() }
+
+        vm.settings.enabled = true
+        await waitUntil { spy.posts.count == 1 }
+        // The Mac slept 61 minutes: Task.sleep didn't count it, the wall
+        // clock did. The next slice must notice the check is due.
+        spy.now = spy.now.addingTimeInterval(61 * 60)
+        await waitUntil { spy.posts.count == 2 }
+
+        XCTAssertEqual(spy.posts.count, 2)
+        vm.settings.enabled = false
     }
 
     @MainActor

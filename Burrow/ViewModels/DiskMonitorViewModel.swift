@@ -34,6 +34,9 @@ final class DiskMonitorViewModel: ObservableObject {
     private let keychain: Keychain
     private let deps: Dependencies
     private let recheckDelay: UInt64
+    /// Longest single sleep of the timer. It waits for `nextCheck` by wall
+    /// clock in slices, since `Task.sleep`'s clock stops while the Mac sleeps.
+    private let timerSlice: TimeInterval
     private static let tokenAccount = "bot-token"
     /// How long a top-folder list is reused while a disk stays low, so each
     /// check doesn't walk the whole home folder again.
@@ -73,15 +76,20 @@ final class DiskMonitorViewModel: ObservableObject {
     /// notification fires when this set grows; a path is only added once
     /// the notification was actually delivered.
     private var alertingPaths: Set<String> = []
+    /// A low-disk notification couldn't be delivered yet (permission still
+    /// undetermined); granting permission re-checks right away.
+    private var notificationPending = false
     private var topFoldersCache: (date: Date, alerting: Set<String>, top: DiskMonitorReport.TopFolders)?
     private var wakeObserver: NSObjectProtocol?
 
     init(defaults: UserDefaults = .standard, keychain: Keychain = .slack,
-         dependencies: Dependencies = Dependencies(), recheckDelay: UInt64 = 1_000_000_000) {
+         dependencies: Dependencies = Dependencies(), recheckDelay: UInt64 = 1_000_000_000,
+         timerSlice: TimeInterval = 60) {
         self.defaults = defaults
         self.keychain = keychain
         self.deps = dependencies
         self.recheckDelay = recheckDelay
+        self.timerSlice = timerSlice
         self.settings = DiskMonitorSettings.load(from: defaults)
         // The Keychain is read lazily (`refreshSlackToken`), not here: this
         // object is created at launch, including as the XCTest host.
@@ -103,8 +111,8 @@ final class DiskMonitorViewModel: ObservableObject {
         reschedule()
     }
 
-    /// The timer sleeps on a clock that stops while the Mac sleeps; after
-    /// waking, run an overdue check now and restart the interval from here.
+    /// The timer notices an overdue check within one slice; on wake, run it
+    /// right away and restart the interval from here.
     func handleWake(now: Date = Date()) {
         guard settings.enabled, let next = nextCheck, now >= next else { return }
         reschedule()
@@ -120,6 +128,7 @@ final class DiskMonitorViewModel: ObservableObject {
         guard settings.enabled else {
             // Start fresh next time: a disk still low on re-enable notifies again.
             alertingPaths = []
+            notificationPending = false
             lastReadings = []
             topFoldersCache = nil
             recheckQueued = false
@@ -133,20 +142,34 @@ final class DiskMonitorViewModel: ObservableObject {
         // so it is retried on the next check.
         Task { [weak self] in
             guard let self else { return }
-            self.notificationsDenied = !(await self.deps.authorize())
+            let granted = await self.deps.authorize()
+            // The hint reflects the real setting, not a failed request.
+            await self.refreshNotificationStatus()
+            if granted && self.notificationPending && self.settings.enabled { self.recheckSoon() }
         }
         loop = Task { [weak self] in
             while !Task.isCancelled {
-                let minutes: Int
+                let slice: TimeInterval
                 do {
                     guard let self else { return }
                     // Unstructured, so cancelling the loop (interval change)
                     // never cancels a Slack post that's already in flight.
                     Task { await self.check() }
-                    minutes = max(1, self.settings.intervalMinutes)
-                    self.nextCheck = Date().addingTimeInterval(TimeInterval(minutes * 60))
+                    let minutes = max(1, self.settings.intervalMinutes)
+                    self.nextCheck = self.deps.now().addingTimeInterval(TimeInterval(minutes * 60))
+                    slice = self.timerSlice
                 }
-                try? await Task.sleep(nanoseconds: UInt64(minutes) * 60 * 1_000_000_000)
+                // Wait until `nextCheck` by wall clock, in short slices: one
+                // long Task.sleep would not count time the Mac spent asleep.
+                while !Task.isCancelled {
+                    let remaining: TimeInterval
+                    do {
+                        guard let self, let next = self.nextCheck else { return }
+                        remaining = next.timeIntervalSince(self.deps.now())
+                    }
+                    if remaining <= 0 { break }
+                    try? await Task.sleep(nanoseconds: UInt64(min(remaining, slice) * 1_000_000_000))
+                }
             }
         }
     }
@@ -207,6 +230,7 @@ final class DiskMonitorViewModel: ObservableObject {
         let alerting = Set(readings.filter { $0.isLow(threshold: s.thresholdPercent) }.map(\.path))
         if alerting.isSubset(of: alertingPaths) {
             alertingPaths = alerting
+            notificationPending = false
         } else {
             let delivered = await deps.notify(readings, s.thresholdPercent)
             guard gen == generation else {
@@ -218,6 +242,7 @@ final class DiskMonitorViewModel: ObservableObject {
             // Undelivered (e.g. permission not granted yet): keep the new
             // paths out, so the next check tries again.
             alertingPaths = delivered ? alerting : alerting.intersection(alertingPaths)
+            notificationPending = !delivered
             if !delivered {
                 await refreshNotificationStatus()
                 guard gen == generation else { return }
@@ -227,13 +252,14 @@ final class DiskMonitorViewModel: ObservableObject {
         let alert = !alerting.isEmpty
         guard alert || !s.alertOnly else { return }
         let wantTop = alert && s.includeTopFolders
-        let top = wantTop ? await topFolders(alerting: alerting) : nil
+        let top = wantTop ? await topFolders(alerting: alerting, generation: gen) : nil
         guard gen == generation else { return }
 
         // Read Slack config now, after the slow part: a token removed or a
         // channel cleared during the scan means no post.
-        refreshSlackToken()
-        guard isSlackConfigured, let token = keychain.read(Self.tokenAccount) else { return }
+        let token = keychain.read(Self.tokenAccount)
+        hasSlackToken = token != nil
+        guard let token, !settings.slackChannel.isEmpty else { return }
         let message = DiskMonitorReport.message(
             host: s.displayName, readings: readings, threshold: s.thresholdPercent,
             topFolders: top, includeTopSection: wantTop, mentions: settings.slackMentions
@@ -243,14 +269,15 @@ final class DiskMonitorViewModel: ObservableObject {
 
     /// The cached list while it's fresh and no new path became low;
     /// otherwise a new (time-bounded) scan.
-    private func topFolders(alerting: Set<String>) async -> DiskMonitorReport.TopFolders? {
+    private func topFolders(alerting: Set<String>, generation gen: Int) async -> DiskMonitorReport.TopFolders? {
         if let cache = topFoldersCache,
            deps.now().timeIntervalSince(cache.date) < Self.topFoldersMaxAge,
            alerting.isSubset(of: cache.alerting) {
             return cache.top
         }
         let top = await deps.scanTopFolders()
-        if let top { topFoldersCache = (deps.now(), alerting, top) }
+        // A stale check (monitor reset meanwhile) must not refill the cache.
+        if let top, gen == generation { topFoldersCache = (deps.now(), alerting, top) }
         return top
     }
 

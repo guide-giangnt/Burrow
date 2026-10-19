@@ -182,7 +182,9 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 enum MonitoringNavigation {
     static let notification = Notification.Name("fun.burrow.showMonitoring")
     static var pending = false
-    static let mainWindowID = NSUserInterfaceItemIdentifier("fun.burrow.mainWindow")
+    /// Windows hosting a `RootView`, held weakly. Kept here rather than as
+    /// an NSWindow.identifier, which SwiftUI uses for window restoration.
+    static let mainWindows = NSHashTable<NSWindow>.weakObjects()
 
     @MainActor
     static func request() {
@@ -193,8 +195,8 @@ enum MonitoringNavigation {
         NSApp.activate(ignoringOtherApps: true)
         // Only windows hosting RootView — not Settings, which also qualifies
         // as a main window but has no Monitoring tab to switch to.
-        let window = NSApp.windows.first {
-            $0.identifier == mainWindowID && ($0.isVisible || $0.isMiniaturized || wasHidden)
+        let window = mainWindows.allObjects.first {
+            $0.isVisible || $0.isMiniaturized || wasHidden
         }
         if let window {
             window.deminiaturize(nil)
@@ -226,8 +228,8 @@ final class HostWindow: ObservableObject {
     weak var window: NSWindow?
 }
 
-/// Tags the NSWindow hosting `RootView` with `MonitoringNavigation.mainWindowID`
-/// so the menu bar can find it among the app's windows.
+/// Registers the NSWindow hosting `RootView` in
+/// `MonitoringNavigation.mainWindows` so the menu bar can find it.
 struct MainWindowMarker: NSViewRepresentable {
     let host: HostWindow
 
@@ -246,7 +248,7 @@ struct MainWindowMarker: NSViewRepresentable {
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            window?.identifier = MonitoringNavigation.mainWindowID
+            if let window { MonitoringNavigation.mainWindows.add(window) }
             host.window = window
         }
     }
@@ -305,7 +307,5 @@ enum MenuBarFormat {
         return "\(lastText) · next \(time.string(from: next))"
     }
 
-    static func percent(_ value: Double) -> String {
-        value.formatted(.number.precision(.fractionLength(0...2))) + "%"
-    }
+    static func percent(_ value: Double) -> String { DiskMonitorReport.threshold(value) }
 }
