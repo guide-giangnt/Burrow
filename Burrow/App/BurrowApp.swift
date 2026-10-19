@@ -5,16 +5,27 @@ import SwiftUI
 struct BurrowApp: App {
     @StateObject private var updater = UpdaterController()
     @StateObject private var catalogUpdates = CatalogUpdateViewModel()
+    @StateObject private var diskMonitor = DiskMonitorViewModel()
 
     private static let githubURL = URL(string: "https://github.com/guide-vinh/Burrow")!
+    private static let isTestHost = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
 
     var body: some Scene {
         WindowGroup {
             RootView()
                 .environmentObject(updater)
+                .environmentObject(diskMonitor)
                 // Best-effort catalog refresh on launch (throttled to 24h);
                 // never blocks the UI or the catalog load.
                 .task { await catalogUpdates.checkOnLaunchIfDue() }
+                // No-op unless the user turned on the disk monitor.
+                .task {
+                    // Unit tests launch this app as their host; a monitor the
+                    // developer left on would otherwise post real Slack reports.
+                    guard !Self.isTestHost else { return }
+                    diskMonitor.start()
+                    MenuBarController.shared.attach(diskMonitor)
+                }
         }
         .commands {
             // Replaces the default no-op "Burrow → About Burrow" group with
