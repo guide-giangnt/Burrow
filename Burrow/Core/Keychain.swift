@@ -7,7 +7,9 @@ import Security
 struct Keychain {
     let service: String
 
-    static let slack = Keychain(service: "fun.burrow.slack")
+    /// Per bundle ID, so the Debug build (`fun.burrow.app.dev`, its own
+    /// signing team) never touches — or gets prompted for — Release's item.
+    static let slack = Keychain(service: (Bundle.main.bundleIdentifier ?? "fun.burrow") + ".slack")
 
     func read(_ account: String) -> String? {
         var query = baseQuery(account)

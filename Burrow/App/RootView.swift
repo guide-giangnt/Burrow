@@ -22,6 +22,7 @@ struct RootView: View {
     @StateObject private var licenseVM = LicenseViewModel()
     // Owned by BurrowApp: the monitor keeps running when no window is open.
     @EnvironmentObject private var diskMonitor: DiskMonitorViewModel
+    @StateObject private var hostWindow = HostWindow()
 
     var body: some View {
         HStack(spacing: 0) {
@@ -37,10 +38,13 @@ struct RootView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await refreshFDAState() }
         }
-        .background(MainWindowMarker())
-        // The menu bar's "Open Monitoring…" / "Custom…" land on this tab.
-        .onReceive(NotificationCenter.default.publisher(for: MonitoringNavigation.notification)) { _ in
-            selection = .monitoring
+        .background(MainWindowMarker(host: hostWindow))
+        // The menu bar's "Open Monitoring…" / "Custom…" land on this tab —
+        // only in the window it brought forward.
+        .onReceive(NotificationCenter.default.publisher(for: MonitoringNavigation.notification)) { note in
+            if let target = note.object as? NSWindow, target === hostWindow.window {
+                selection = .monitoring
+            }
         }
         .onAppear {
             if MonitoringNavigation.pending {
@@ -117,10 +121,7 @@ struct RootView: View {
         .padding(.bottom, Spacing.md)
     }
 
-    /// `CFBundleShortVersionString` from Info.plist; falls back to "—".
-    private var appVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
-    }
+    private var appVersion: String { Bundle.main.shortVersion }
 
     /// User-facing app name. `CFBundleDisplayName` carries the per-configuration
     /// name ("Burrow Dev" for Debug builds) so this shows the dev suffix

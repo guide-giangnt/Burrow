@@ -6,8 +6,30 @@ struct SettingsView: View {
     @ObservedObject var updater: UpdaterController
     @ObservedObject var catalogUpdates: CatalogUpdateViewModel
 
+    // SMAppService status is an IPC call; read it on appear, not per render.
+    @State private var openAtLogin = false
+    @State private var loginItemMessage: String?
+
     var body: some View {
         Form {
+            if LoginItem.isSupported {
+                Section("General") {
+                    Toggle("Open Burrow at login", isOn: Binding(
+                        get: { openAtLogin },
+                        set: { newValue in
+                            loginItemMessage = LoginItem.setEnabled(newValue)
+                            openAtLogin = LoginItem.isEnabled
+                        }
+                    ))
+                    if let loginItemMessage {
+                        Text(loginItemMessage)
+                            .font(.captionM)
+                            .foregroundStyle(Color.fgSecondary)
+                    }
+                }
+                .onAppear { openAtLogin = LoginItem.isEnabled }
+            }
+
             Section("Updates") {
                 Toggle("Automatically check for updates", isOn: Binding(
                     get: { updater.automaticallyChecksForUpdates },

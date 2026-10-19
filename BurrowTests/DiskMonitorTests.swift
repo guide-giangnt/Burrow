@@ -31,15 +31,13 @@ final class DiskMonitorTests: XCTestCase {
         XCTAssertEqual(DiskMonitorSettings.load(from: defaults), s)
     }
 
-    func testSettingsSavedBeforeANewFieldStillLoad() throws {
-        // JSON written by a build without `showInMenuBar` must keep the
-        // user's values instead of resetting everything to defaults.
-        let legacy = #"{"enabled":true,"thresholdPercent":30,"intervalMinutes":60,"paths":["/"],"machineName":"","slackChannel":"C0123ABCD","slackMentions":[],"alertOnly":false,"includeTopFolders":true}"#
-        let s = try JSONDecoder().decode(DiskMonitorSettings.self, from: Data(legacy.utf8))
+    func testSettingsMissingAFieldStillLoad() throws {
+        // Settings saved before a field existed must keep the user's values
+        // instead of resetting everything to defaults.
+        let older = #"{"enabled":true,"thresholdPercent":30,"intervalMinutes":60,"paths":["/"],"machineName":"","slackChannel":"C0123ABCD","slackMentions":[],"alertOnly":false,"includeTopFolders":true}"#
+        let s = try JSONDecoder().decode(DiskMonitorSettings.self, from: Data(older.utf8))
         XCTAssertTrue(s.enabled)
         XCTAssertEqual(s.thresholdPercent, 30)
-        XCTAssertEqual(s.slackChannel, "C0123ABCD")
-        XCTAssertEqual(s.slackChannelLink, "")
         XCTAssertFalse(s.alertOnly)
         XCTAssertTrue(s.showInMenuBar)
         XCTAssertEqual(s.percentDisplay, .used)
@@ -48,6 +46,13 @@ final class DiskMonitorTests: XCTestCase {
         let u = try JSONDecoder().decode(DiskMonitorSettings.self, from: Data(unknown.utf8))
         XCTAssertEqual(u.percentDisplay, .used)
         XCTAssertEqual(u.thresholdPercent, 15)
+    }
+
+    func testDisplayNameFallsBackAndIsCapped() {
+        var s = DiskMonitorSettings()
+        XCTAssertEqual(s.displayName, DiskMonitorSettings.computerName)
+        s.machineName = String(repeating: "x", count: 500)
+        XCTAssertEqual(s.displayName.count, 80)
     }
 
     // MARK: - Menu bar
@@ -80,6 +85,7 @@ final class DiskMonitorTests: XCTestCase {
 
     func testParseThreshold() throws {
         XCTAssertEqual(try DiskMonitorSettings.parseThreshold("7.5"), 7.5)
+        XCTAssertEqual(try DiskMonitorSettings.parseThreshold("7,5"), 7.5)
         XCTAssertEqual(try DiskMonitorSettings.parseThreshold(" 12 % "), 12)
         XCTAssertEqual(try DiskMonitorSettings.parseThreshold("0"), 0)
         XCTAssertEqual(try DiskMonitorSettings.parseThreshold("100"), 100)
@@ -105,20 +111,14 @@ final class DiskMonitorTests: XCTestCase {
         XCTAssertEqual(s.slackChannel, "C0123ABCD")
         XCTAssertEqual(s.slackChannelLink, "https://guide.slack.com/archives/C0123ABCD")
 
-        // Clearing a saved link turns Slack off.
+        // A rejected input changes nothing.
+        XCTAssertThrowsError(try s.applyChannelLink("C0999"))
+        XCTAssertEqual(s.slackChannel, "C0123ABCD")
+
+        // Clearing the link turns Slack off.
         try s.applyChannelLink("")
         XCTAssertEqual(s.slackChannel, "")
         XCTAssertEqual(s.slackChannelLink, "")
-
-        // An ID saved by an earlier build has no link; an empty field keeps it.
-        var legacy = DiskMonitorSettings()
-        legacy.slackChannel = "C07MC01NSAH"
-        try legacy.applyChannelLink("")
-        XCTAssertEqual(legacy.slackChannel, "C07MC01NSAH")
-
-        // A rejected input changes nothing.
-        XCTAssertThrowsError(try legacy.applyChannelLink("C0999"))
-        XCTAssertEqual(legacy.slackChannel, "C07MC01NSAH")
     }
 
     func testParseChannelFromSlackLink() throws {
@@ -163,20 +163,21 @@ final class DiskMonitorTests: XCTestCase {
         XCTAssertFalse(DiskMonitorReport.isAlert([], threshold: 10))
     }
 
-    func testAlertMessageTagsMentionsAndListsFolders() throws {
+    func testAlertMessageTagsMentionsInBodyAndListsFolders() throws {
         let low = Reading(path: "/", total: 500 * gb, free: 20 * gb, failed: false)
         let msg = DiskMonitorReport.message(
-            host: "Build Mac", readings: [low], threshold: 10,
+            host: "Build Mac", readings: [low], threshold: 7.5,
             topFolders: [.init(path: NSHomeDirectory() + "/Library", bytes: 40 * gb)],
             mentions: ["U01", "S02"]
         )
-        XCTAssertEqual(msg.text, ":warning: Low disk space - Build Mac")
+        // Mentions in the top-level text, where Slack notifies for them.
+        XCTAssertEqual(msg.text, ":warning: Low disk space - Build Mac\n<@U01> <!subteam^S02>")
         let attachment = try XCTUnwrap(msg.attachments.first)
         XCTAssertEqual(attachment.color, DiskMonitorReport.alertColor)
-        XCTAssertEqual(attachment.blocks.count, 4)
-        XCTAssertTrue(attachment.blocks[0].text.contains("*20.0 GB* of 500.0 GB (4.0% free, threshold 10%, *below threshold*)"))
-        XCTAssertTrue(attachment.blocks[1].text.contains("40.0 GB  ~/Library"))
-        XCTAssertEqual(attachment.blocks[2].text, "<@U01> <!subteam^S02>")
+        XCTAssertEqual(attachment.blocks.count, 3)
+        XCTAssertTrue(attachment.blocks[0].mrkdwn.contains("*20.0 GB* of 500.0 GB (4% free, threshold 7.5%, *below threshold*)"))
+        XCTAssertTrue(attachment.blocks[1].mrkdwn.contains("40.0 GB  ~/Library"))
+        XCTAssertFalse(attachment.blocks.contains { $0.mrkdwn.contains("<@U01>") })
     }
 
     func testOKMessageHasNoMentions() throws {
@@ -189,10 +190,16 @@ final class DiskMonitorTests: XCTestCase {
         XCTAssertEqual(attachment.blocks.count, 2)
     }
 
+    func testPercentFormatIsLocaleFree() {
+        XCTAssertEqual(DiskMonitorReport.percent(7.5), "7.5")
+        XCTAssertEqual(DiskMonitorReport.percent(10), "10")
+        XCTAssertEqual(DiskMonitorReport.percent(26.44), "26.4")
+    }
+
     func testUnreadableAndEscapedText() throws {
         let msg = DiskMonitorReport.message(host: "<!channel> & co", readings: [.unreadable("/Volumes/<X>")],
                                             threshold: 10, topFolders: nil, mentions: [])
-        let text = try XCTUnwrap(msg.attachments.first?.blocks.first?.text)
+        let text = try XCTUnwrap(msg.attachments.first?.blocks.first?.mrkdwn)
         XCTAssertTrue(text.contains("Host: *&lt;!channel&gt; &amp; co*"))
         XCTAssertTrue(text.contains("`/Volumes/&lt;X&gt;`: *not measured*"))
         XCTAssertEqual(msg.text, ":warning: Low disk space - &lt;!channel&gt; &amp; co")
@@ -202,8 +209,19 @@ final class DiskMonitorTests: XCTestCase {
         let low = Reading(path: "/", total: 100 * gb, free: 1 * gb, failed: false)
         let timedOut = DiskMonitorReport.message(host: "M", readings: [low], threshold: 10,
                                                  topFolders: nil, includeTopSection: true, mentions: [])
-        XCTAssertTrue(try XCTUnwrap(timedOut.attachments.first).blocks[1].text.contains("didn't finish"))
+        XCTAssertTrue(try XCTUnwrap(timedOut.attachments.first).blocks[1].mrkdwn.contains("didn't finish"))
         XCTAssertEqual(DiskMonitorReport.formatTop([]), "*Top space consumers*\nNothing measurable found.")
+    }
+
+    func testLooseFilesRowAndRanking() {
+        // ~/Downloads: 45 GB total, one 1 GB subfolder → 44 GB of loose files.
+        let loose = DiskMonitorReport.looseFiles(in: "/Users/a/Downloads", total: 45 * gb, children: [1 * gb])
+        XCTAssertEqual(loose, [.init(path: "/Users/a/Downloads/*", bytes: 44 * gb)])
+        XCTAssertEqual(DiskMonitorReport.looseFiles(in: "/x", total: 1 * gb, children: [1 * gb]), [])
+
+        let ranked = DiskMonitorReport.rank(loose + [.init(path: "/Users/a/Downloads/sub", bytes: 1 * gb)], limit: 1)
+        XCTAssertEqual(ranked.map(\.path), ["/Users/a/Downloads/*"])
+        XCTAssertTrue(DiskMonitorReport.formatTop(loose).contains("44.0 GB  /Users/a/Downloads/*"))
     }
 
     func testEveryMessageEndsWithBurrowSignature() throws {
@@ -215,7 +233,7 @@ final class DiskMonitorTests: XCTestCase {
         XCTAssertEqual(report.attachments.first?.blocks.last, expected)
         XCTAssertEqual(test.attachments.first?.blocks.last, expected)
         XCTAssertEqual(test.text, ":white_check_mark: Slack test - M")
-        XCTAssertFalse(try XCTUnwrap(test.attachments.first?.blocks.first).text.contains(test.text))
+        XCTAssertFalse(try XCTUnwrap(test.attachments.first?.blocks.first).mrkdwn.contains(test.text))
     }
 
     func testContextBlockEncoding() throws {
@@ -227,23 +245,33 @@ final class DiskMonitorTests: XCTestCase {
         XCTAssertNil(json["text"])
     }
 
-    func testBlockEncodesAsMrkdwnSection() throws {
-        let data = try JSONEncoder().encode(SlackClient.Block(text: "hi"))
+    func testSectionBlockEncoding() throws {
+        let data = try JSONEncoder().encode(SlackClient.Block.section("hi"))
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertEqual(json["type"] as? String, "section")
         let text = try XCTUnwrap(json["text"] as? [String: String])
         XCTAssertEqual(text, ["type": "mrkdwn", "text": "hi"])
-    }
-
-    func testTilde() {
-        XCTAssertEqual(DiskMonitorReport.tilde("/Users/a/Library", home: "/Users/a"), "~/Library")
-        XCTAssertEqual(DiskMonitorReport.tilde("/Users/a", home: "/Users/a"), "~")
-        XCTAssertEqual(DiskMonitorReport.tilde("/Users/ab", home: "/Users/a"), "/Users/ab")
+        XCTAssertNil(json["elements"])
     }
 
     func testExplainSlackErrors() {
         XCTAssertTrue(DiskMonitorViewModel.explain(SlackClient.SlackError.api("not_in_channel")).contains("/invite"))
+        XCTAssertTrue(DiskMonitorViewModel.explain(SlackClient.SlackError.api("channel_not_found")).contains("link"))
         XCTAssertEqual(DiskMonitorViewModel.explain(SlackClient.SlackError.api("weird")), "Slack error: weird.")
+    }
+
+    // MARK: - Reading volumes
+
+    func testHungVolumeTimesOutAsUnreadableWithoutBlockingOthers() async {
+        let gb = self.gb
+        let start = Date()
+        let readings = await DiskMonitorReport.readAll(["/", "/Volumes/Hung", "/Volumes/B"], timeout: 0.2) { path in
+            if path == "/Volumes/Hung" { Thread.sleep(forTimeInterval: 2) }
+            return Reading(path: path, total: 100 * gb, free: 50 * gb, failed: false)
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1.5)
+        XCTAssertEqual(readings.map(\.path), ["/", "/Volumes/Hung", "/Volumes/B"])
+        XCTAssertEqual(readings.map(\.failed), [false, true, false])
     }
 
     // MARK: - check()
@@ -251,9 +279,11 @@ final class DiskMonitorTests: XCTestCase {
     private final class Spy {
         var posts: [(SlackClient.Message, String, String)] = []
         var notifications = 0
+        var deliver = true
         var scans = 0
         var free: [String: Int64] = [:]
         var postDelay: UInt64 = 0
+        var scanDelay: UInt64 = 0
     }
 
     @MainActor
@@ -264,21 +294,32 @@ final class DiskMonitorTests: XCTestCase {
         let kc = Keychain(service: "fun.burrow.tests.\(UUID().uuidString)")
         if let token { kc.write(token, for: "bot-token") }
 
-        var s = DiskMonitorSettings()   // enabled stays false: no timer, no permission prompt
+        var s = DiskMonitorSettings()
         s.slackChannel = "C0123ABCD"
         configure(&s)
         s.save(to: defaults)
 
         var deps = DiskMonitorViewModel.Dependencies()
         let total = 100 * gb
-        deps.read = { path in Reading(path: path, total: total, free: spy.free[path] ?? 50 * total / 100, failed: false) }
-        deps.scanTopFolders = { spy.scans += 1; return [] }
+        deps.readAll = { paths in
+            paths.map { Reading(path: $0, total: total, free: spy.free[$0] ?? 50 * total / 100, failed: false) }
+        }
+        deps.scanTopFolders = {
+            spy.scans += 1
+            if spy.scanDelay > 0 { try? await Task.sleep(nanoseconds: spy.scanDelay) }
+            return []
+        }
         deps.post = { msg, token, channel in
             if spy.postDelay > 0 { try await Task.sleep(nanoseconds: spy.postDelay) }
             spy.posts.append((msg, token, channel))
         }
-        deps.notify = { _, _ in spy.notifications += 1 }
+        deps.authorize = { true }
+        deps.notify = { _, _ in
+            spy.notifications += 1
+            return spy.deliver
+        }
 
+        // Stored `enabled` doesn't start a timer: only start() or toggling does.
         let vm = DiskMonitorViewModel(defaults: defaults, keychain: kc, dependencies: deps, recheckDelay: 10_000_000)
         return (vm, { kc.delete("bot-token"); defaults.removePersistentDomain(forName: suite) })
     }
@@ -325,6 +366,34 @@ final class DiskMonitorTests: XCTestCase {
     }
 
     @MainActor
+    func testUndeliveredNotificationIsRetriedNextCheck() async throws {
+        let spy = Spy()
+        spy.free["/"] = 5 * gb
+        spy.deliver = false   // e.g. permission not granted yet
+        let (vm, cleanup) = try makeVM(spy) { _ in }
+        defer { cleanup() }
+
+        await vm.check()
+        spy.deliver = true
+        await vm.check()
+        await vm.check()
+        XCTAssertEqual(spy.notifications, 2)   // retried once, then quiet
+    }
+
+    @MainActor
+    func testTopFoldersAreReusedWhileFresh() async throws {
+        let spy = Spy()
+        spy.free["/"] = 5 * gb
+        let (vm, cleanup) = try makeVM(spy) { _ in }
+        defer { cleanup() }
+
+        await vm.check()
+        await vm.check()
+        XCTAssertEqual(spy.posts.count, 2)
+        XCTAssertEqual(spy.scans, 1)
+    }
+
+    @MainActor
     func testReportEveryCheckWithoutTopFoldersWhenNotAlertOnly() async throws {
         let spy = Spy()
         let (vm, cleanup) = try makeVM(spy) { $0.alertOnly = false }
@@ -341,8 +410,6 @@ final class DiskMonitorTests: XCTestCase {
     func testChangingThresholdRechecksWithNewValue() async throws {
         let spy = Spy()
         spy.free["/"] = 26 * gb
-        // Enabled in stored settings: init doesn't start the timer, so only
-        // the threshold change below can trigger a check.
         let (vm, cleanup) = try makeVM(spy) { $0.enabled = true; $0.alertOnly = false }
         defer { cleanup() }
 
@@ -353,7 +420,7 @@ final class DiskMonitorTests: XCTestCase {
         XCTAssertEqual(spy.posts.count, 1)
         let attachment = try XCTUnwrap(spy.posts.first?.0.attachments.first)
         XCTAssertEqual(attachment.color, DiskMonitorReport.alertColor)
-        XCTAssertTrue(attachment.blocks[0].text.contains("threshold 30%"))
+        XCTAssertTrue(attachment.blocks[0].mrkdwn.contains("threshold 30%"))
         XCTAssertEqual(spy.notifications, 1)
     }
 
@@ -373,22 +440,77 @@ final class DiskMonitorTests: XCTestCase {
         try await Task.sleep(nanoseconds: 500_000_000)
 
         XCTAssertEqual(spy.posts.count, 2)
-        XCTAssertTrue(try XCTUnwrap(spy.posts.last?.0.attachments.first).blocks[0].text.contains("threshold 30%"))
+        XCTAssertTrue(try XCTUnwrap(spy.posts.last?.0.attachments.first).blocks[0].mrkdwn.contains("threshold 30%"))
     }
 
     @MainActor
-    func testDisablingCancelsPendingRecheck() async throws {
+    func testDisablingDuringScanPostsNothing() async throws {
         let spy = Spy()
         spy.free["/"] = 5 * gb
+        spy.scanDelay = 200_000_000
         let (vm, cleanup) = try makeVM(spy) { $0.enabled = true }
         defer { cleanup() }
 
-        vm.settings.thresholdPercent = 30
-        vm.settings.enabled = false
-        try await Task.sleep(nanoseconds: 300_000_000)
+        let running = Task { await vm.check() }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        vm.settings.enabled = false   // mid-scan
+        await running.value
 
         XCTAssertTrue(spy.posts.isEmpty)
-        XCTAssertEqual(spy.notifications, 0)
+        XCTAssertTrue(vm.lastReadings.isEmpty, "a stale check must not restore state reset by disable")
+    }
+
+    @MainActor
+    func testRescheduleDuringRecheckStillReports() async throws {
+        let spy = Spy()
+        spy.free["/"] = 5 * gb
+        spy.scanDelay = 200_000_000
+        let (vm, cleanup) = try makeVM(spy) { $0.enabled = true }
+        defer { cleanup() }
+
+        vm.settings.thresholdPercent = 15             // recheck starts after 10 ms
+        try await Task.sleep(nanoseconds: 50_000_000)  // …and is now scanning
+        vm.settings.intervalMinutes = 30              // reschedule mid-check
+        try await Task.sleep(nanoseconds: 800_000_000)
+
+        // The interrupted check is superseded, not lost: one report arrives.
+        XCTAssertEqual(spy.posts.count, 1)
+        XCTAssertTrue(try XCTUnwrap(spy.posts.first?.0.attachments.first).blocks[0].mrkdwn.contains("threshold 15%"))
+    }
+
+    @MainActor
+    func testDisableAndReenableDropsThePendingRecheck() async throws {
+        let spy = Spy()
+        spy.free["/"] = 26 * gb
+        let (vm, cleanup) = try makeVM(spy) { $0.enabled = true; $0.alertOnly = false }
+        defer { cleanup() }
+
+        vm.settings.thresholdPercent = 30   // recheck pending for 10 ms
+        vm.settings.enabled = false         // cancels it…
+        vm.settings.enabled = true          // …and the new timer checks once
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        XCTAssertEqual(spy.posts.count, 1)
+    }
+
+    @MainActor
+    func testOverdueCheckRunsOnWake() async throws {
+        let spy = Spy()
+        let (vm, cleanup) = try makeVM(spy) { $0.alertOnly = false }
+        defer { cleanup() }
+
+        vm.settings.enabled = true   // timer: one check now, next in 60 min
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(spy.posts.count, 1)
+
+        vm.handleWake(now: Date().addingTimeInterval(30 * 60))   // not due yet
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(spy.posts.count, 1)
+
+        vm.handleWake(now: Date().addingTimeInterval(2 * 3600))  // overdue after sleep
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(spy.posts.count, 2)
+        vm.settings.enabled = false
     }
 
     @MainActor
@@ -403,6 +525,21 @@ final class DiskMonitorTests: XCTestCase {
         await noChannel.check()
         XCTAssertTrue(spy.posts.isEmpty)
         XCTAssertEqual(spy.notifications, 2)
+    }
+
+    @MainActor
+    func testBlankTokenNeverDeletesTheStoredOne() throws {
+        let spy = Spy()
+        let (vm, cleanup) = try makeVM(spy) { _ in }
+        defer { cleanup() }
+
+        vm.refreshSlackToken()
+        XCTAssertTrue(vm.hasSlackToken)
+        vm.saveSlackToken("   ")
+        vm.refreshSlackToken()
+        XCTAssertTrue(vm.hasSlackToken)
+        vm.removeSlackToken()
+        XCTAssertFalse(vm.hasSlackToken)
     }
 
     // MARK: - Keychain

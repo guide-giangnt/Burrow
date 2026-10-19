@@ -9,12 +9,19 @@ struct MonitoringGeneralSection: View {
     @State private var customThreshold = ""
     @State private var thresholdError: String?
     @State private var pathsDraft = ""
+    @State private var nameDraft = ""
 
     var body: some View {
         Section("Disk Monitor") {
             Toggle("Watch free disk space", isOn: $vm.settings.enabled)
 
             if vm.settings.enabled {
+                if vm.notificationsDenied {
+                    Text("Notifications are off for Burrow. Turn them on in System Settings → Notifications to get low-disk alerts.")
+                        .font(.captionM)
+                        .foregroundStyle(Color.destructive)
+                }
+
                 Picker("Alert when free space is at or below", selection: $vm.settings.thresholdPercent) {
                     ForEach(DiskMonitorSettings.thresholdPresets, id: \.self) { value in
                         Text(MenuBarFormat.percent(value)).tag(value)
@@ -44,8 +51,10 @@ struct MonitoringGeneralSection: View {
                     Button("Set", action: applyPaths)
                 }
 
-                TextField("Name in reports", text: $vm.settings.machineName,
-                          prompt: Text(Host.current().localizedName ?? "This Mac"))
+                // A draft, saved on Return or when leaving the tab — not a
+                // UserDefaults write per keystroke.
+                TextField("Name in reports", text: $nameDraft, prompt: Text(DiskMonitorSettings.computerName))
+                    .onSubmit(applyName)
 
                 Toggle("Show in menu bar", isOn: $vm.settings.showInMenuBar)
 
@@ -55,17 +64,13 @@ struct MonitoringGeneralSection: View {
                     }
                 }
                 .pickerStyle(.segmented)
-
-                if vm.supportsOpenAtLogin {
-                    Toggle("Open Burrow at login", isOn: Binding(
-                        get: { vm.openAtLogin },
-                        set: { vm.openAtLogin = $0 }
-                    ))
-                    if let error = vm.loginItemError { errorText(error) }
-                }
             }
         }
-        .onAppear { pathsDraft = vm.settings.paths.joined(separator: ", ") }
+        .onAppear {
+            pathsDraft = vm.settings.paths.joined(separator: ", ")
+            nameDraft = vm.settings.machineName
+        }
+        .onDisappear(perform: applyName)
     }
 
     private func applyCustomThreshold() {
@@ -80,6 +85,10 @@ struct MonitoringGeneralSection: View {
     private func applyPaths() {
         vm.settings.paths = DiskMonitorSettings.parsePaths(pathsDraft)
         pathsDraft = vm.settings.paths.joined(separator: ", ")
+    }
+
+    private func applyName() {
+        vm.settings.machineName = nameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func intervalLabel(_ minutes: Int) -> String {
@@ -101,60 +110,57 @@ struct MonitoringSlackSection: View {
     @State private var slackError: String?
 
     var body: some View {
-            Section("Slack (optional)") {
-                Text("Leave empty to get macOS notifications only. The Slack app needs the chat:write scope, and the bot must be invited to the channel.")
+        Section("Slack (optional)") {
+            Text("Leave empty to get macOS notifications only. The Slack app needs the chat:write scope, and the bot must be invited to the channel.")
+                .font(.captionM)
+                .foregroundStyle(Color.fgSecondary)
+
+            SecureField("Bot token", text: $tokenDraft,
+                        prompt: Text(vm.hasSlackToken ? "Saved in Keychain" : "xoxb-…"))
+            TextField("Channel link", text: $channelDraft, prompt: Text("https://…slack.com/archives/C0123ABCD"))
+            TextField("Tag on alerts", text: $mentionsDraft, prompt: Text("U0123ABCD, S0456EFGH"))
+
+            Toggle("Only post when space is low", isOn: $vm.settings.alertOnly)
+            Toggle("Include largest folders on alerts", isOn: $vm.settings.includeTopFolders)
+
+            HStack {
+                if vm.hasSlackToken {
+                    Button("Remove Token") { vm.removeSlackToken() }
+                }
+                Spacer()
+                Button("Send Test Message") { Task { await vm.sendTestMessage() } }
+                    .disabled(!vm.isSlackConfigured || hasUnsavedSlackEdits)
+                Button("Save", action: saveSlack)
+                    .disabled(!hasUnsavedSlackEdits)
+            }
+
+            if hasUnsavedSlackEdits {
+                Text("Save to apply your changes before sending a test.")
                     .font(.captionM)
-                    .foregroundStyle(Color.fgSecondary)
-
-                SecureField("Bot token", text: $tokenDraft,
-                            prompt: Text(vm.hasSlackToken ? "Saved in Keychain" : "xoxb-…"))
-                TextField("Channel link", text: $channelDraft, prompt: Text("https://…slack.com/archives/C0123ABCD"))
-                if vm.settings.slackChannelLink.isEmpty && !vm.settings.slackChannel.isEmpty && channelDraft.isEmpty {
-                    // Saved by an earlier build as a bare ID; still works.
-                    Text("Posting to \(vm.settings.slackChannel). Paste the channel link to change it.")
-                        .font(.captionM)
-                        .foregroundStyle(Color.fgMuted)
-                }
-                TextField("Tag on alerts", text: $mentionsDraft, prompt: Text("U0123ABCD, S0456EFGH"))
-
-                Toggle("Only post when space is low", isOn: $vm.settings.alertOnly)
-                Toggle("Include largest folders on alerts", isOn: $vm.settings.includeTopFolders)
-
-                HStack {
-                    if vm.hasSlackToken {
-                        Button("Remove Token") { vm.saveSlackToken("") }
-                    }
-                    Spacer()
-                    Button("Send Test Message") { Task { await vm.sendTestMessage() } }
-                        .disabled(!vm.isSlackConfigured || hasUnsavedSlackEdits)
-                    Button("Save", action: saveSlack)
-                        .disabled(!hasUnsavedSlackEdits)
-                }
-
-                if hasUnsavedSlackEdits {
-                    Text("Save to apply your changes before sending a test.")
-                        .font(.captionM)
-                        .foregroundStyle(Color.fgMuted)
-                }
-                if let slackError {
-                    errorText(slackError)
-                } else if let status = vm.slackStatus {
-                    Text(status).font(.captionM).foregroundStyle(Color.fgSecondary)
-                }
+                    .foregroundStyle(Color.fgMuted)
             }
-            .onChange(of: channelDraft) { _ in slackError = nil }
-            .onChange(of: mentionsDraft) { _ in slackError = nil }
-            .onAppear {
-                channelDraft = vm.settings.slackChannelLink
-                mentionsDraft = vm.settings.slackMentions.joined(separator: ", ")
+            if let slackError {
+                errorText(slackError)
+            } else if let status = vm.slackStatus {
+                Text(status).font(.captionM).foregroundStyle(Color.fgSecondary)
             }
+        }
+        .onChange(of: channelDraft) { _ in slackError = nil }
+        .onChange(of: mentionsDraft) { _ in slackError = nil }
+        .onAppear {
+            vm.refreshSlackToken()
+            channelDraft = vm.settings.slackChannelLink
+            mentionsDraft = vm.settings.slackMentions.joined(separator: ", ")
+        }
     }
 
     private var hasUnsavedSlackEdits: Bool {
-        !tokenDraft.isEmpty
-            || channelDraft.trimmingCharacters(in: .whitespaces) != vm.settings.slackChannelLink
+        !trimmed(tokenDraft).isEmpty
+            || trimmed(channelDraft) != vm.settings.slackChannelLink
             || (try? DiskMonitorSettings.parseMentions(mentionsDraft)) != vm.settings.slackMentions
     }
+
+    private func trimmed(_ s: String) -> String { s.trimmingCharacters(in: .whitespacesAndNewlines) }
 
     private func saveSlack() {
         do {
@@ -163,10 +169,9 @@ struct MonitoringSlackSection: View {
             slackError = nil
             vm.settings.slackMentions = mentions
             channelDraft = vm.settings.slackChannelLink
-            if !tokenDraft.isEmpty {
-                vm.saveSlackToken(tokenDraft)
-                tokenDraft = ""
-            }
+            // Blank input never deletes the stored token; that's Remove Token.
+            vm.saveSlackToken(tokenDraft)
+            tokenDraft = ""
         } catch {
             slackError = error.localizedDescription
         }

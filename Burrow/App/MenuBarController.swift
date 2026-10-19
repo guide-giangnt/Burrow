@@ -8,7 +8,7 @@ import SwiftUI
 /// the threshold presets and quick actions. AppKit `NSStatusItem` rather
 /// than SwiftUI `MenuBarExtra`, which needs macOS 13.
 @MainActor
-final class MenuBarController: NSObject {
+final class MenuBarController: NSObject, NSMenuDelegate {
 
     static let shared = MenuBarController()
 
@@ -16,7 +16,7 @@ final class MenuBarController: NSObject {
     private var statusItem: NSStatusItem?
     private var observation: AnyCancellable?
 
-    /// Idempotent: every new window's launch `.task` calls this.
+    /// Called once from `AppDelegate`; safe to call again.
     func attach(_ vm: DiskMonitorViewModel) {
         guard self.vm == nil else { return }
         self.vm = vm
@@ -34,7 +34,7 @@ final class MenuBarController: NSObject {
             statusItem = nil
             return
         }
-        let item = statusItem ?? NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let item = statusItem ?? makeStatusItem()
         statusItem = item
 
         let look = MenuBarFormat.look(vm.lastReadings, threshold: vm.settings.thresholdPercent,
@@ -47,14 +47,29 @@ final class MenuBarController: NSObject {
             button.title = look.title.isEmpty ? "" : " \(look.title)"
             button.toolTip = "Burrow Disk Monitor"
         }
-        item.menu = buildMenu(vm)
+    }
+
+    private func makeStatusItem() -> NSStatusItem {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        menu.delegate = self
+        item.menu = menu
+        return item
     }
 
     // MARK: - Menu
 
-    private func buildMenu(_ vm: DiskMonitorViewModel) -> NSMenu {
-        let menu = NSMenu()
-        menu.autoenablesItems = false
+    /// Built when the menu opens rather than on every state change.
+    nonisolated func menuNeedsUpdate(_ menu: NSMenu) {
+        MainActor.assumeIsolated {
+            guard let vm else { return }
+            menu.removeAllItems()
+            fill(menu, from: vm)
+        }
+    }
+
+    private func fill(_ menu: NSMenu, from vm: DiskMonitorViewModel) {
 
         menu.addItem(disabled("Burrow Disk Monitor"))
         menu.addItem(.separator())
@@ -114,7 +129,6 @@ final class MenuBarController: NSObject {
         menu.addItem(.separator())
         menu.addItem(action("Open Monitoring…", #selector(openMonitoring)))
         menu.addItem(action("Quit Burrow", #selector(quit), key: "q"))
-        return menu
     }
 
     private func disabled(_ title: String) -> NSMenuItem {
@@ -163,8 +177,8 @@ final class MenuBarController: NSObject {
 
 /// Lets the menu bar bring a Burrow window forward on the Monitoring tab,
 /// including when every window was closed (the app keeps running for the
-/// monitor). An open `RootView` reacts to the notification; a newly created
-/// one picks up `pending` when it appears.
+/// monitor). The chosen `RootView` reacts to the notification (its window is
+/// the notification's object); a newly created one picks up `pending`.
 enum MonitoringNavigation {
     static let notification = Notification.Name("fun.burrow.showMonitoring")
     static var pending = false
@@ -172,42 +186,68 @@ enum MonitoringNavigation {
 
     @MainActor
     static func request() {
+        // Windows of a hidden app (⌘H) report isVisible == false; unhide
+        // first so they count, instead of opening a duplicate window.
+        let wasHidden = NSApp.isHidden
+        if wasHidden { NSApp.unhide(nil) }
         NSApp.activate(ignoringOtherApps: true)
         // Only windows hosting RootView — not Settings, which also qualifies
         // as a main window but has no Monitoring tab to switch to.
         let window = NSApp.windows.first {
-            $0.identifier == mainWindowID && ($0.isVisible || $0.isMiniaturized)
+            $0.identifier == mainWindowID && ($0.isVisible || $0.isMiniaturized || wasHidden)
         }
         if let window {
             window.deminiaturize(nil)
             window.makeKeyAndOrderFront(nil)
-            NotificationCenter.default.post(name: notification, object: nil)
+            NotificationCenter.default.post(name: notification, object: window)
         } else {
             pending = true
-            openNewWindow()
+            // Nothing to open the window with (⌘N remapped): don't leave a
+            // stale request that a later, unrelated window would act on.
+            if !openNewWindow() { pending = false }
         }
     }
 
     /// SwiftUI's WindowGroup adds File → New Window (⌘N); trigger it.
     @MainActor
-    private static func openNewWindow() {
+    private static func openNewWindow() -> Bool {
         guard let items = NSApp.mainMenu?.items.compactMap(\.submenu).flatMap(\.items),
-              let newWindow = items.first(where: { $0.keyEquivalent == "n" && $0.keyEquivalentModifierMask == .command })
-        else { return }
-        newWindow.menu?.performActionForItem(at: newWindow.menu?.index(of: newWindow) ?? 0)
+              let newWindow = items.first(where: { $0.keyEquivalent == "n" && $0.keyEquivalentModifierMask == .command }),
+              let menu = newWindow.menu
+        else { return false }
+        menu.performActionForItem(at: menu.index(of: newWindow))
+        return true
     }
+}
+
+/// Weak handle on the NSWindow hosting a `RootView`, filled by
+/// `MainWindowMarker`, so the view can tell which window a request targets.
+final class HostWindow: ObservableObject {
+    weak var window: NSWindow?
 }
 
 /// Tags the NSWindow hosting `RootView` with `MonitoringNavigation.mainWindowID`
 /// so the menu bar can find it among the app's windows.
 struct MainWindowMarker: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView { Marker() }
+    let host: HostWindow
+
+    func makeNSView(context: Context) -> NSView { Marker(host: host) }
     func updateNSView(_ nsView: NSView, context: Context) {}
 
     private final class Marker: NSView {
+        let host: HostWindow
+
+        init(host: HostWindow) {
+            self.host = host
+            super.init(frame: .zero)
+        }
+
+        required init?(coder: NSCoder) { nil }
+
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             window?.identifier = MonitoringNavigation.mainWindowID
+            host.window = window
         }
     }
 }
@@ -252,10 +292,14 @@ enum MenuBarFormat {
         }
     }
 
-    static func schedule(last: Date?, next: Date?, now: Date = Date()) -> String {
-        let time = DateFormatter()
-        time.locale = Locale(identifier: "en_US_POSIX")
-        time.dateFormat = "HH:mm"
+    private static let time: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "HH:mm"
+        return f
+    }()
+
+    static func schedule(last: Date?, next: Date?) -> String {
         let lastText = last.map { "Last check \(time.string(from: $0))" } ?? "Not checked yet"
         guard let next else { return lastText }
         return "\(lastText) · next \(time.string(from: next))"

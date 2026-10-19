@@ -45,9 +45,12 @@ struct MonitoringView: View {
                 Text("Monitoring")
                     .font(.system(size: 28, weight: .semibold, design: .rounded))
                     .foregroundStyle(Color.fgPrimary)
-                Text(summary)
-                    .font(.bodyM)
-                    .foregroundStyle(vm.settings.enabled && vm.isAlert ? Color.destructive : Color.fgSecondary)
+                // Re-rendered every 30 s so "checked 2 minutes ago" stays true.
+                TimelineView(.periodic(from: .now, by: 30)) { _ in
+                    Text(summary)
+                        .font(.bodyM)
+                        .foregroundStyle(vm.settings.enabled && vm.isAlert ? Color.destructive : Color.fgSecondary)
+                }
             }
             Spacer(minLength: Spacing.sm)
             if vm.settings.enabled {
@@ -76,7 +79,7 @@ private struct VolumeRow: View {
     let threshold: Double
     let display: DiskMonitorSettings.PercentDisplay
 
-    private var isLow: Bool { reading.failed || reading.freePercent <= threshold }
+    private var isLow: Bool { reading.isLow(threshold: threshold) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.xs) {

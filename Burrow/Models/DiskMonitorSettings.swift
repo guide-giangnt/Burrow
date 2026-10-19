@@ -1,4 +1,5 @@
 import Foundation
+import SystemConfiguration
 
 /// User-filled configuration for the background disk monitor. Everything is
 /// off / empty by default; nothing ships pre-configured. The Slack bot token
@@ -95,10 +96,11 @@ struct DiskMonitorSettings: Codable, Equatable {
     }
 
     /// Parses a threshold typed by the user, with or without a trailing %.
+    /// Accepts "7.5" and "7,5", since the picker shows the locale's format.
     static func parseThreshold(_ input: String) throws -> Double {
         var s = input.trimmingCharacters(in: .whitespaces)
         if s.hasSuffix("%") { s.removeLast() }
-        s = s.trimmingCharacters(in: .whitespaces)
+        s = s.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ".")
         guard let value = Double(s), value >= 0, value <= 100 else {
             throw ValidationError.threshold(input)
         }
@@ -134,14 +136,12 @@ struct DiskMonitorSettings: Codable, Equatable {
         return id
     }
 
-    /// Applies what the user typed in the channel-link field. An empty field
-    /// clears the channel (Slack off) — except for a setting saved by an
-    /// earlier build as a bare ID: it has no link to show, so the field
-    /// starts empty and saving other Slack edits must keep that channel.
+    /// Applies what the user typed in the channel-link field: the link is
+    /// kept for display, its ID for the API. An empty field turns Slack off.
+    /// Invalid input throws and changes nothing.
     mutating func applyChannelLink(_ input: String) throws {
         let draft = input.trimmingCharacters(in: .whitespacesAndNewlines)
         let channel = try Self.parseChannel(draft)
-        if draft.isEmpty && slackChannelLink.isEmpty { return }
         slackChannel = channel
         slackChannelLink = channel.isEmpty ? "" : draft
     }
@@ -169,9 +169,16 @@ struct DiskMonitorSettings: Codable, Equatable {
     }
 
     /// Name used in reports: the configured one, else the computer's name.
+    /// Capped so a pasted essay can't push a Slack section past its limit.
     var displayName: String {
-        let trimmed = machineName.trimmingCharacters(in: .whitespaces)
-        if !trimmed.isEmpty { return trimmed }
-        return Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+        let trimmed = machineName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return String((trimmed.isEmpty ? Self.computerName : trimmed).prefix(80))
+    }
+
+    /// The Mac's name from Sharing settings. Read from the local
+    /// configuration store — unlike `Host.current()`, it never does a
+    /// network lookup that can block the main thread.
+    static var computerName: String {
+        (SCDynamicStoreCopyComputerName(nil, nil) as String?) ?? ProcessInfo.processInfo.hostName
     }
 }

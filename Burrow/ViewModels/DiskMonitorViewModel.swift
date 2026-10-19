@@ -1,26 +1,28 @@
+import AppKit
 import Foundation
-import ServiceManagement
 import SwiftUI // ObservableObject + @Published only
-import UserNotifications
 import os
 
 /// Backs the Monitoring tab. While enabled it checks the configured volumes
 /// on a timer, raises a macOS notification when one drops to or below the
 /// threshold, and — if the user filled in Slack — posts a report to their
-/// channel. Runs while Burrow is running; "Open at login" keeps it running
-/// across restarts. Report logic lives in `DiskMonitorReport`, delivery in
-/// `SlackClient`; I/O is injected so `check()` can be unit-tested.
+/// channel. Owned by `AppDelegate`, so it runs whether or not a window is
+/// open. Report logic lives in `DiskMonitorReport`, delivery in
+/// `SlackClient` / `DiskMonitorNotifier`; I/O is injected for tests.
 @MainActor
 final class DiskMonitorViewModel: ObservableObject {
 
     /// Side effects, swappable in tests.
     struct Dependencies {
-        var read: @Sendable (String) -> DiskMonitorReport.Reading = DiskMonitorReport.read
+        var readAll: ([String]) async -> [DiskMonitorReport.Reading] = { await DiskMonitorReport.readAll($0) }
         var scanTopFolders: () async -> [DiskMonitorReport.Folder]? = { await DiskMonitorReport.scanTopFolders() }
         var post: (SlackClient.Message, _ token: String, _ channel: String) async throws -> Void = { message, token, channel in
             try await SlackClient(token: token).post(message, to: channel)
         }
-        var notify: ([DiskMonitorReport.Reading], Double) -> Void = DiskMonitorNotifier.notify
+        /// Asks for notification permission; true when banners may be shown.
+        var authorize: () async -> Bool = { await DiskMonitorNotifier.authorize() }
+        /// Shows the low-disk notification; true when it was delivered.
+        var notify: ([DiskMonitorReport.Reading], Double) async -> Bool = { await DiskMonitorNotifier.notify($0, threshold: $1) }
     }
 
     private let logger = Logger(subsystem: "fun.burrow", category: "DiskMonitorViewModel")
@@ -29,6 +31,9 @@ final class DiskMonitorViewModel: ObservableObject {
     private let deps: Dependencies
     private let recheckDelay: UInt64
     private static let tokenAccount = "bot-token"
+    /// How long a top-folder list is reused while a disk stays low, so each
+    /// check doesn't walk the whole home folder again.
+    private static let topFoldersMaxAge: TimeInterval = 3600
 
     @Published var settings: DiskMonitorSettings {
         didSet {
@@ -42,23 +47,30 @@ final class DiskMonitorViewModel: ObservableObject {
             }
         }
     }
-    @Published private(set) var hasSlackToken: Bool
+    @Published private(set) var hasSlackToken = false
     @Published private(set) var lastReadings: [DiskMonitorReport.Reading] = []
     @Published private(set) var lastChecked: Date?
     /// When the timer fires next; nil while the monitor is off.
     @Published private(set) var nextCheck: Date?
     @Published private(set) var isChecking = false
     @Published private(set) var slackStatus: String?
-    @Published private(set) var loginItemError: String?
+    /// The user declined notifications; the tab says so.
+    @Published private(set) var notificationsDenied = false
 
     private var loop: Task<Void, Never>?
     private var pendingRecheck: Task<Void, Never>?
-    /// Set when a re-check was asked for while a check (possibly a long
-    /// top-folder scan) was running; that check runs one more afterwards.
+    /// Bumped by every reschedule (enable, disable, interval change). A check
+    /// started under an older generation stops at its next await, so it
+    /// can't post after the monitor was turned off or overwrite reset state.
+    private var generation = 0
+    /// A check was asked for while one was running; run once more after it.
     private var recheckQueued = false
-    /// Paths that were alerting at the previous check. A notification fires
-    /// when this set grows, not on every check while a disk stays low.
+    /// Paths whose low state the user has already been notified about. A
+    /// notification fires when this set grows; a path is only added once
+    /// the notification was actually delivered.
     private var alertingPaths: Set<String> = []
+    private var topFoldersCache: (date: Date, alerting: Set<String>, folders: [DiskMonitorReport.Folder])?
+    private var wakeObserver: NSObjectProtocol?
 
     init(defaults: UserDefaults = .standard, keychain: Keychain = .slack,
          dependencies: Dependencies = Dependencies(), recheckDelay: UInt64 = 1_000_000_000) {
@@ -67,19 +79,35 @@ final class DiskMonitorViewModel: ObservableObject {
         self.deps = dependencies
         self.recheckDelay = recheckDelay
         self.settings = DiskMonitorSettings.load(from: defaults)
-        self.hasSlackToken = keychain.read(Self.tokenAccount) != nil
+        // The Keychain is read lazily (`refreshSlackToken`), not here: this
+        // object is created at launch, including as the XCTest host.
     }
 
     // MARK: - Scheduling
 
-    /// Starts the timer if enabled. Safe to call more than once (each new
-    /// window runs the launch `.task`).
+    /// Starts the timer if enabled and catches up after sleep. Called once
+    /// from `AppDelegate`; safe to call again.
     func start() {
+        if wakeObserver == nil {
+            wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.handleWake() }
+            }
+        }
         guard loop == nil else { return }
         reschedule()
     }
 
+    /// The timer sleeps on a clock that stops while the Mac sleeps; after
+    /// waking, run an overdue check now and restart the interval from here.
+    func handleWake(now: Date = Date()) {
+        guard settings.enabled, let next = nextCheck, now >= next else { return }
+        reschedule()
+    }
+
     private func reschedule() {
+        generation += 1
         loop?.cancel()
         loop = nil
         pendingRecheck?.cancel()
@@ -89,11 +117,16 @@ final class DiskMonitorViewModel: ObservableObject {
             // Start fresh next time: a disk still low on re-enable notifies again.
             alertingPaths = []
             lastReadings = []
+            topFoldersCache = nil
             recheckQueued = false
             return
         }
-        DiskMonitorNotifier.requestPermission()
+        // Only while monitoring: no Keychain access on launch when it's off.
+        refreshSlackToken()
         loop = Task { [weak self] in
+            // Ask before the first check, so its notification isn't dropped
+            // while permission is still undetermined.
+            if let self { await self.updateAuthorization() }
             while !Task.isCancelled {
                 let minutes: Int
                 do {
@@ -101,10 +134,10 @@ final class DiskMonitorViewModel: ObservableObject {
                     // Unstructured, so cancelling the loop (interval change)
                     // never cancels a Slack post that's already in flight.
                     Task { await self.check() }
-                    minutes = self.settings.intervalMinutes
-                    self.nextCheck = Date().addingTimeInterval(TimeInterval(max(1, minutes) * 60))
+                    minutes = max(1, self.settings.intervalMinutes)
+                    self.nextCheck = Date().addingTimeInterval(TimeInterval(minutes * 60))
                 }
-                try? await Task.sleep(nanoseconds: UInt64(max(1, minutes)) * 60 * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: UInt64(minutes) * 60 * 1_000_000_000)
             }
         }
     }
@@ -118,12 +151,14 @@ final class DiskMonitorViewModel: ObservableObject {
         pendingRecheck = Task { [weak self] in
             try? await Task.sleep(nanoseconds: self?.recheckDelay ?? 0)
             guard !Task.isCancelled, let self, self.settings.enabled else { return }
-            if self.isChecking {
-                self.recheckQueued = true
-            } else {
-                await self.check()
-            }
+            // Unstructured, like the timer's: cancelling this debounce later
+            // must not cancel the check (and its Slack post) once started.
+            Task { await self.check() }
         }
+    }
+
+    private func updateAuthorization() async {
+        notificationsDenied = !(await deps.authorize())
     }
 
     // MARK: - Checking
@@ -135,9 +170,13 @@ final class DiskMonitorViewModel: ObservableObject {
     }
 
     /// Reads every path, notifies on a new alert and posts to Slack when
-    /// configured. Called by the timer and by "Check Now".
+    /// configured. Called by the timer, re-checks and "Check Now". If a check
+    /// is already running, this one is queued to run right after it.
     func check() async {
-        guard !isChecking else { return }
+        guard !isChecking else {
+            recheckQueued = true
+            return
+        }
         isChecking = true
         defer {
             isChecking = false
@@ -147,29 +186,58 @@ final class DiskMonitorViewModel: ObservableObject {
             }
         }
 
+        let gen = generation
         let s = settings
-        // Off the main actor: a stale network mount can block for seconds.
-        let read = deps.read
-        let readings = await Task.detached { s.paths.map(read) }.value
-        let alert = DiskMonitorReport.isAlert(readings, threshold: s.thresholdPercent)
+        let readings = await deps.readAll(s.paths)
+        guard gen == generation else { return }
         lastReadings = readings
         lastChecked = Date()
 
-        let alerting = Set(readings.filter { $0.failed || $0.freePercent <= s.thresholdPercent }.map(\.path))
-        if !alerting.isSubset(of: alertingPaths) { deps.notify(readings, s.thresholdPercent) }
-        alertingPaths = alerting
+        let alerting = Set(readings.filter { $0.isLow(threshold: s.thresholdPercent) }.map(\.path))
+        if alerting.isSubset(of: alertingPaths) {
+            alertingPaths = alerting
+        } else {
+            let delivered = await deps.notify(readings, s.thresholdPercent)
+            guard gen == generation else {
+                // Rescheduled meanwhile (e.g. interval change): the user did
+                // see this alert, so don't repeat it on the next check.
+                if delivered && settings.enabled { alertingPaths.formUnion(alerting) }
+                return
+            }
+            // Undelivered (e.g. permission not granted yet): keep the new
+            // paths out, so the next check tries again.
+            alertingPaths = delivered ? alerting : alerting.intersection(alertingPaths)
+            if !delivered { await updateAuthorization() }
+        }
 
-        guard isSlackConfigured, alert || !s.alertOnly,
-              let token = keychain.read(Self.tokenAccount)
-        else { return }
-
+        let alert = !alerting.isEmpty
+        guard alert || !s.alertOnly else { return }
         let wantTop = alert && s.includeTopFolders
-        let top = wantTop ? await deps.scanTopFolders() : nil
+        let top = wantTop ? await topFolders(alerting: alerting) : nil
+        guard gen == generation else { return }
+
+        // Read Slack config now, after the slow part: a token removed or a
+        // channel cleared during the scan means no post.
+        refreshSlackToken()
+        guard isSlackConfigured, let token = keychain.read(Self.tokenAccount) else { return }
         let message = DiskMonitorReport.message(
             host: s.displayName, readings: readings, threshold: s.thresholdPercent,
-            topFolders: top, includeTopSection: wantTop, mentions: s.slackMentions
+            topFolders: top, includeTopSection: wantTop, mentions: settings.slackMentions
         )
-        await post(message, token: token, channel: s.slackChannel, success: "Report sent to Slack.")
+        await post(message, token: token, channel: settings.slackChannel, success: "Report sent to Slack.")
+    }
+
+    /// The cached list while it's fresh and no new path became low;
+    /// otherwise a new (time-bounded) scan.
+    private func topFolders(alerting: Set<String>) async -> [DiskMonitorReport.Folder]? {
+        if let cache = topFoldersCache,
+           Date().timeIntervalSince(cache.date) < Self.topFoldersMaxAge,
+           alerting.isSubset(of: cache.alerting) {
+            return cache.folders
+        }
+        let folders = await deps.scanTopFolders()
+        if let folders { topFoldersCache = (Date(), alerting, folders) }
+        return folders
     }
 
     /// "Send Test Message" — verifies token, channel and bot membership.
@@ -199,7 +267,7 @@ final class DiskMonitorViewModel: ObservableObject {
         }
         switch code {
         case "not_in_channel": return "The bot isn't in that channel. Run /invite @your-bot in Slack."
-        case "channel_not_found": return "Channel not found. Check the channel ID."
+        case "channel_not_found": return "Channel not found. Check the channel link."
         case "invalid_auth", "not_authed", "token_revoked": return "The bot token was rejected. Check it and save again."
         case "missing_scope": return "The Slack app needs the chat:write scope."
         default: return "Slack error: \(code)."
@@ -208,82 +276,31 @@ final class DiskMonitorViewModel: ObservableObject {
 
     // MARK: - Slack token (Keychain)
 
+    /// Re-reads whether a token is stored. Cheap enough for the Slack
+    /// section's `onAppear`; kept off the launch path.
+    func refreshSlackToken() {
+        hasSlackToken = keychain.read(Self.tokenAccount) != nil
+    }
+
+    /// Stores a new token. Blank input is ignored — removing the token is
+    /// the explicit "Remove Token" button, never a side effect of Save.
     func saveSlackToken(_ token: String) {
         let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
         if keychain.write(trimmed, for: Self.tokenAccount) {
-            hasSlackToken = !trimmed.isEmpty
-            slackStatus = trimmed.isEmpty ? "Token removed." : "Token saved to the Keychain."
+            hasSlackToken = true
+            slackStatus = "Token saved to the Keychain."
         } else {
             slackStatus = "Couldn't save the token to the Keychain."
         }
     }
 
-    // MARK: - Open at login (macOS 13+)
-
-    var supportsOpenAtLogin: Bool {
-        if #available(macOS 13.0, *) { return true }
-        return false
-    }
-
-    var openAtLogin: Bool {
-        get {
-            guard #available(macOS 13.0, *) else { return false }
-            let status = SMAppService.mainApp.status
-            return status == .enabled || status == .requiresApproval
+    func removeSlackToken() {
+        if keychain.delete(Self.tokenAccount) {
+            hasSlackToken = false
+            slackStatus = "Token removed."
+        } else {
+            slackStatus = "Couldn't remove the token from the Keychain."
         }
-        set {
-            guard #available(macOS 13.0, *) else { return }
-            objectWillChange.send()
-            loginItemError = nil
-            do {
-                if newValue {
-                    try SMAppService.mainApp.register()
-                } else {
-                    try SMAppService.mainApp.unregister()
-                }
-            } catch {
-                logger.error("Open at login failed: \(error.localizedDescription, privacy: .public)")
-                loginItemError = error.localizedDescription
-            }
-            if SMAppService.mainApp.status == .requiresApproval {
-                loginItemError = "Allow Burrow in System Settings → General → Login Items."
-            }
-        }
-    }
-}
-
-/// Local notifications for low disk space. Also the notification-center
-/// delegate, so banners still show while Burrow is the frontmost app.
-final class DiskMonitorNotifier: NSObject, UNUserNotificationCenterDelegate {
-    static let shared = DiskMonitorNotifier()
-
-    static func requestPermission() {
-        let center = UNUserNotificationCenter.current()
-        center.delegate = shared
-        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
-    }
-
-    static func notify(_ readings: [DiskMonitorReport.Reading], threshold: Double) {
-        let content = UNMutableNotificationContent()
-        content.title = "Low disk space"
-        content.body = readings
-            .filter { $0.failed || $0.freePercent <= threshold }
-            .map { r in
-                r.failed
-                    ? "\(r.path): couldn't be read"
-                    : "\(r.path): \(DiskMonitorReport.gb(r.free)) free (\(String(format: "%.1f", r.freePercent))%)"
-            }
-            .joined(separator: "\n")
-        content.sound = .default
-        let request = UNNotificationRequest(identifier: "fun.burrow.diskmonitor.low", content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
-    }
-
-    func userNotificationCenter(
-        _ center: UNUserNotificationCenter,
-        willPresent notification: UNNotification,
-        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
-    ) {
-        completionHandler([.banner, .sound])
     }
 }

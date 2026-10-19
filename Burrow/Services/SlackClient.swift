@@ -15,32 +15,22 @@ struct SlackClient {
 
     /// A Block Kit block holding mrkdwn text: a `section` for the body, or
     /// a small grey `context` line (used for the "Sent from Burrow" footer).
+    /// Optional fields are left out of the JSON, so one shape covers both.
     struct Block: Encodable, Equatable {
-        enum Kind: String { case section, context }
-
-        let text: String
-        var kind: Kind = .section
-
-        static func context(_ text: String) -> Block { Block(text: text, kind: .context) }
-
-        enum CodingKeys: String, CodingKey { case type, text, elements }
-        enum TextKeys: String, CodingKey { case type, text }
-
-        func encode(to encoder: Encoder) throws {
-            var c = encoder.container(keyedBy: CodingKeys.self)
-            try c.encode(kind.rawValue, forKey: .type)
-            switch kind {
-            case .section:
-                var t = c.nestedContainer(keyedBy: TextKeys.self, forKey: .text)
-                try t.encode("mrkdwn", forKey: .type)
-                try t.encode(text, forKey: .text)
-            case .context:
-                var elements = c.nestedUnkeyedContainer(forKey: .elements)
-                var t = elements.nestedContainer(keyedBy: TextKeys.self)
-                try t.encode("mrkdwn", forKey: .type)
-                try t.encode(text, forKey: .text)
-            }
+        struct Text: Encodable, Equatable {
+            var type = "mrkdwn"
+            let text: String
         }
+
+        let type: String
+        var text: Text?
+        var elements: [Text]?
+
+        static func section(_ mrkdwn: String) -> Block { Block(type: "section", text: Text(text: mrkdwn)) }
+        static func context(_ mrkdwn: String) -> Block { Block(type: "context", elements: [Text(text: mrkdwn)]) }
+
+        /// The block's text, whichever field holds it.
+        var mrkdwn: String { text?.text ?? elements?.first?.text ?? "" }
     }
 
     /// `text` is the notification fallback when attachments are set.
